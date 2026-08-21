@@ -6821,8 +6821,11 @@ static void post_main(struct uloop_timeout *t)
 			jail_chown_writable_surfaces();
 		}
 
-		if ((opts.namespace & CLONE_NEWNET) && opts.name && opts.ocibundle)
-			run_uxc_net("up");
+		if ((opts.namespace & CLONE_NEWNET) && opts.name && opts.ocibundle &&
+		    run_uxc_net("up")) {
+			ERROR("uxc-net failed to configure the container network\n");
+			free_and_exit(EXIT_FAILURE);
+		}
 
 		if ((opts.namespace & CLONE_NEWNET) && opts.name)
 			jail_network_attach(parent_ctx, opts.name, jail_process.pid);
