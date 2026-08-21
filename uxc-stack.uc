@@ -204,6 +204,12 @@ function backhaul_prepare() {
 					side['org.openwrt.network.host'] = kv[1];
 			}
 		}
+		if (inst.proto)
+			side['org.openwrt.network.proto'] = inst.proto;
+		if (inst.proto6)
+			side['org.openwrt.network.proto6'] = inst.proto6;
+		if (inst.ip6ifaceid)
+			side['org.openwrt.network.ip6ifaceid'] = inst.ip6ifaceid;
 		writefile(REG_DIR + '/' + qname(inst.name) + '.annotations', sprintf('%J\n', side));
 	}
 }
