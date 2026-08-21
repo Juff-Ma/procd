@@ -36,16 +36,6 @@ let loopback_section = "config interface 'loopback'\n" +
 	"\toption ipaddr '127.0.0.1'\n" +
 	"\toption netmask '255.0.0.0'\n\n";
 
-let write_injail = function(name, lan_section) {
-	fs.mkdir(injail_dir, 0755);
-	let f = fs.open(injail_path(name), "w");
-	if (!f)
-		return;
-	f.write(loopback_section);
-	f.write(lan_section);
-	f.close();
-};
-
 let call = function(object, method, data) {
 	ubus.call({ object: object, method: method, data: data });
 	let err = ubus.error();
@@ -177,6 +167,48 @@ let append_injail = function(name, section) {
 		f.write(loopback_section);
 	f.write(section);
 	f.close();
+};
+
+let render_section = function(iface, device, proto, opts) {
+	let s = "config interface '" + iface + "'\n" +
+		"\toption device '" + device + "'\n" +
+		"\toption proto '" + proto + "'\n", k, v;
+
+	for (k, v in opts)
+		s += "\toption " + k + " '" + v + "'\n";
+	return s;
+};
+
+let injail_proto = function(ann, kind) {
+	let proto = ann["org.openwrt.network.proto"];
+
+	if (proto == null || proto == "")
+		return kind == "routed" ? "static" : "dhcp";
+	if (proto == "static")
+		return proto;
+	if (proto == "dhcp") {
+		if (kind != "routed")
+			return proto;
+		warn("uxc-net: routed cannot use proto 'dhcp': the /31 gateway link has no DHCP server\n");
+		return null;
+	}
+	warn(sprintf("uxc-net: unsupported org.openwrt.network.proto '%s'\n", proto));
+	return null;
+};
+
+let bridged_static_opts = function(ann) {
+	let addr = ann["org.openwrt.network.address"], opts;
+
+	if (addr == null || index(addr, "/") < 0) {
+		warn("uxc-net: bridged proto 'static' needs org.openwrt.network.address as address/prefix\n");
+		return null;
+	}
+	opts = { ipaddr: addr };
+	if (ann["org.openwrt.network.gateway"])
+		opts.gateway = ann["org.openwrt.network.gateway"];
+	if (ann["org.openwrt.network.dns"])
+		opts.dns = ann["org.openwrt.network.dns"];
+	return opts;
 };
 
 let csv = function(val) {
@@ -337,6 +369,15 @@ let ensure_network = function(net) {
 let bridged_up = function(name, ann, attach, m) {
 	let net = attach.network;
 	let vh = host_veth(name), vc = cont_veth(name);
+	let proto = injail_proto(ann, "bridged"), opts = {};
+
+	if (!proto)
+		return 1;
+	if (proto == "static") {
+		opts = bridged_static_opts(ann);
+		if (!opts)
+			return 1;
+	}
 
 	if (ann["org.openwrt.network.egress"] || ann["org.openwrt.network.ingress"])
 		warn("uxc-net: bridged takes no egress/ingress (L2 inherits the joined network's zone); ignoring\n");
@@ -363,9 +404,7 @@ let bridged_up = function(name, ann, attach, m) {
 	}))
 		return 1;
 
-	write_injail(name, "config interface 'lan'\n" +
-		"\toption device 'eth0'\n" +
-		"\toption proto 'dhcp'\n");
+	append_injail(name, render_section("lan", "eth0", proto, opts));
 
 	return 0;
 };
@@ -490,6 +529,10 @@ let routed_up = function(name, ann, m) {
 	let vh = host_veth(name), vc = cont_veth(name);
 	let gw_iface = gwif(name);
 	let gw_ip = split(net.gw_cidr, "/")[0];
+	let proto = injail_proto(ann, "routed");
+
+	if (!proto)
+		return 1;
 
 	if (call("network", "create_device",
 		 with_macs({ name: vh, type: "veth", peer_name: vc }, m, "h", "c")))
@@ -519,13 +562,12 @@ let routed_up = function(name, ann, m) {
 
 	fw_uci_create(name, ann, net);
 
-	write_injail(name, "config interface 'lan'\n" +
-		"\toption device 'eth0'\n" +
-		"\toption proto 'static'\n" +
-		"\toption ipaddr '" + net.container + "'\n" +
-		"\toption netmask '255.255.255.254'\n" +
-		"\toption gateway '" + gw_ip + "'\n" +
-		"\toption dns '" + gw_ip + "'\n");
+	append_injail(name, render_section("lan", "eth0", proto, {
+		ipaddr: net.container,
+		netmask: "255.255.255.254",
+		gateway: gw_ip,
+		dns: gw_ip,
+	}));
 
 	return 0;
 };
@@ -570,11 +612,10 @@ let backhaul_up = function(name, bh, m) {
 		return 1;
 
 	if (bh.address)
-		append_injail(name, "config interface 'backhaul'\n" +
-			"\toption device 'bh0'\n" +
-			"\toption proto 'static'\n" +
-			"\toption ipaddr '" + bh.address + "'\n" +
-			"\toption netmask '255.255.255.0'\n");
+		append_injail(name, render_section("backhaul", "bh0", "static", {
+			ipaddr: bh.address,
+			netmask: "255.255.255.0",
+		}));
 
 	return 0;
 };
@@ -619,6 +660,8 @@ let do_up = function(name, bundle) {
 
 	attach = parse_attach(ann);
 	bh = parse_backhaul(ann);
+
+	fs.unlink(injail_path(name));
 
 	let roles = [];
 	if (attach.kind == "bridged" || attach.kind == "routed") {
