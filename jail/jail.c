@@ -4898,6 +4898,31 @@ static const char *annotation_get(struct blob_attr *attrs, const char *key)
 	return NULL;
 }
 
+static struct timespec jail_created;
+
+static void oci_state_fill_runtime(struct blob_buf *b)
+{
+	char buf[40];
+	struct tm tm;
+	size_t len;
+
+	if (opts.extroot)
+		blobmsg_add_string(b, "rootfs", opts.extroot);
+
+	if (!jail_created.tv_sec)
+		return;
+
+	if (!gmtime_r(&jail_created.tv_sec, &tm))
+		return;
+
+	len = strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+	if (!len)
+		return;
+
+	snprintf(buf + len, sizeof(buf) - len, ".%09ldZ", jail_created.tv_nsec);
+	blobmsg_add_string(b, "created", buf);
+}
+
 static void oci_state_fill_network(struct blob_buf *b)
 {
 	struct blob_buf sidecar = { 0 };
@@ -5021,6 +5046,7 @@ static int handle_state(struct ubus_context *ctx, struct ubus_object *obj,
 {
 	blob_buf_init(&bb, 0);
 	oci_state_fill(&bb);
+	oci_state_fill_runtime(&bb);
 	oci_state_fill_network(&bb);
 	ubus_send_reply(ctx, req, bb.head);
 
@@ -6995,6 +7021,7 @@ static void post_create_runtime(void)
 		close(userns_pipe[3]);
 	}
 
+	clock_gettime(CLOCK_REALTIME, &jail_created);
 	jail_oci_state = OCI_STATE_CREATED;
 	emit_instance_event("instance.ready");
 
