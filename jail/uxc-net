@@ -211,6 +211,53 @@ let bridged_static_opts = function(ann) {
 	return opts;
 };
 
+let injail_proto6 = function(ann) {
+	let proto6 = ann["org.openwrt.network.proto6"];
+
+	if (proto6 == null || proto6 == "" || proto6 == "none")
+		return "none";
+	if (proto6 == "dhcpv6" || proto6 == "slaac" || proto6 == "static")
+		return proto6;
+	warn(sprintf("uxc-net: unsupported org.openwrt.network.proto6 '%s'\n", proto6));
+	return null;
+};
+
+let injail6_section = function(ann) {
+	let proto6 = injail_proto6(ann);
+	let ifaceid = ann["org.openwrt.network.ip6ifaceid"];
+	let addr6 = ann["org.openwrt.network.address6"];
+	let opts = {};
+
+	if (!proto6)
+		return null;
+	if (proto6 == "none")
+		return "";
+
+	if (proto6 == "static") {
+		if (addr6 == null || index(addr6, "/") < 0) {
+			warn("uxc-net: proto6 'static' needs org.openwrt.network.address6 as address/prefix\n");
+			return null;
+		}
+		opts.ip6addr = addr6;
+		if (ann["org.openwrt.network.gateway6"])
+			opts.ip6gw = ann["org.openwrt.network.gateway6"];
+		return render_section("lan6", "eth0", "static", opts);
+	}
+
+	if (proto6 == "slaac") {
+		opts.reqaddress = "none";
+		opts.reqprefix = "no";
+	}
+	if (ifaceid) {
+		if (!match(ifaceid, /^::/)) {
+			warn(sprintf("uxc-net: org.openwrt.network.ip6ifaceid '%s' must have a zero network part\n", ifaceid));
+			return null;
+		}
+		opts.ip6ifaceid = ifaceid;
+	}
+	return render_section("lan6", "eth0", "dhcpv6", opts);
+};
+
 let csv = function(val) {
 	let list = [], i, parts;
 	if (type(val) != "string")
@@ -370,8 +417,9 @@ let bridged_up = function(name, ann, attach, m) {
 	let net = attach.network;
 	let vh = host_veth(name), vc = cont_veth(name);
 	let proto = injail_proto(ann, "bridged"), opts = {};
+	let section6 = injail6_section(ann);
 
-	if (!proto)
+	if (!proto || section6 == null)
 		return 1;
 	if (proto == "static") {
 		opts = bridged_static_opts(ann);
@@ -405,6 +453,8 @@ let bridged_up = function(name, ann, attach, m) {
 		return 1;
 
 	append_injail(name, render_section("lan", "eth0", proto, opts));
+	if (section6 != "")
+		append_injail(name, section6);
 
 	return 0;
 };
@@ -530,8 +580,9 @@ let routed_up = function(name, ann, m) {
 	let gw_iface = gwif(name);
 	let gw_ip = split(net.gw_cidr, "/")[0];
 	let proto = injail_proto(ann, "routed");
+	let section6 = injail6_section(ann);
 
-	if (!proto)
+	if (!proto || section6 == null)
 		return 1;
 
 	if (call("network", "create_device",
@@ -568,6 +619,8 @@ let routed_up = function(name, ann, m) {
 		gateway: gw_ip,
 		dns: gw_ip,
 	}));
+	if (section6 != "")
+		append_injail(name, section6);
 
 	return 0;
 };
