@@ -55,6 +55,7 @@
 
 static bool verbose = false;
 static bool json_output = false;
+static bool quiet_output = false;
 static int stdio_fds[STDIO_FDS_NUM] = { STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO };
 static const char *confdir = UXC_ETC_CONFDIR;
 static struct ustream_fd cufd;
@@ -123,7 +124,9 @@ static const struct option delete_opts[] = {
 };
 
 static const struct option list_opts[] = {
+	{"format",		required_argument,	0,	'f'	},
 	{"json",		no_argument,		0,	'j'	},
+	{"quiet",		no_argument,		0,	'q'	},
 	{0,			0,			0,	0	}
 };
 
@@ -377,7 +380,7 @@ static int usage(void) {
 	printf("\t[--root <dir>] [--rootless[=auto|true|false]]\n");
 	printf("\t[--systemd-cgroup] [--criu <path>]\n");
 	printf("commands:\n");
-	printf("\tlist [--json]\t\t\t\tlist all configured containers (runc-compatible)\n");
+	printf("\tlist [--json|--format json] [--quiet]\tlist all configured containers (runc-compatible)\n");
 	printf("\tattach <conf>\t\t\t\tattach to container console\n");
 	printf("\tcreate <conf>\t\t\t\t(re-)create <conf>\n");
 	printf("\t\t[--bundle <path>]\t\t\tOCI bundle at <path>\n");
@@ -1081,6 +1084,18 @@ static int uxc_list(void)
 	size_t id_w = 2, pid_w = 3, status_w = 6, bundle_w = 6, created_w = 7, owner_w = 5;
 	char pidstr[12];
 	char netstr[512];
+
+	if (quiet_output) {
+		blobmsg_for_each_attr(cur, blob_data(conf.head), rem) {
+			blobmsg_parse(conf_policy, __CONF_MAX, tb,
+				      blobmsg_data(cur), blobmsg_len(cur));
+			if (!tb[CONF_NAME] || !tb[CONF_PATH])
+				continue;
+
+			printf("%s\n", blobmsg_get_string(tb[CONF_NAME]));
+		}
+		return 0;
+	}
 
 	if (json_output) {
 		blob_buf_init(&buf, 0);
@@ -2742,9 +2757,20 @@ next_global:
 	opterr = 1;
 
 	if (!strcmp(verb, "list")) {
-		while ((c = getopt_long(verb_argc, verb_argv, "j", list_opts, NULL)) != -1) {
+		while ((c = getopt_long(verb_argc, verb_argv, "f:jq", list_opts, NULL)) != -1) {
 			switch (c) {
+			case 'f':
+				if (!strcmp(optarg, "json")) {
+					json_output = true;
+				} else if (!strcmp(optarg, "table")) {
+					json_output = false;
+				} else {
+					fprintf(stderr, "uxc: invalid format '%s'\n", optarg);
+					goto usage_out;
+				}
+				break;
 			case 'j': json_output = true; break;
+			case 'q': quiet_output = true; break;
 			default: goto usage_out;
 			}
 		}
