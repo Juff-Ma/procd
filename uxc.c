@@ -626,6 +626,7 @@ enum {
 	STATE_PID,
 	STATE_BUNDLE,
 	STATE_ANNOTATIONS,
+	STATE_NETWORK,
 	__STATE_MAX,
 };
 
@@ -636,6 +637,29 @@ static const struct blobmsg_policy state_policy[__STATE_MAX] = {
 	[STATE_PID] = { .name = "pid", .type = BLOBMSG_TYPE_INT32 },
 	[STATE_BUNDLE] = { .name = "bundle", .type = BLOBMSG_TYPE_STRING },
 	[STATE_ANNOTATIONS] = { .name = "annotations", .type = BLOBMSG_TYPE_TABLE },
+	[STATE_NETWORK] = { .name = "org.openwrt.network", .type = BLOBMSG_TYPE_TABLE },
+};
+
+enum {
+	NET_NAMESPACE,
+	NET_INTERFACES,
+	__NET_MAX,
+};
+
+static const struct blobmsg_policy net_policy[__NET_MAX] = {
+	[NET_NAMESPACE] = { .name = "namespace", .type = BLOBMSG_TYPE_STRING },
+	[NET_INTERFACES] = { .name = "interfaces", .type = BLOBMSG_TYPE_ARRAY },
+};
+
+enum {
+	NET_IF_NAME,
+	NET_IF_ADDRESSES,
+	__NET_IF_MAX,
+};
+
+static const struct blobmsg_policy net_if_policy[__NET_IF_MAX] = {
+	[NET_IF_NAME] = { .name = "name", .type = BLOBMSG_TYPE_STRING },
+	[NET_IF_ADDRESSES] = { .name = "addresses", .type = BLOBMSG_TYPE_ARRAY },
 };
 
 
@@ -996,17 +1020,67 @@ static int uxc_state(char *name)
 	return 0;
 }
 
+static void netinfo_str(struct blob_attr *netinfo, char *out, size_t outlen)
+{
+	struct blob_attr *tn[__NET_MAX], *ti[__NET_IF_MAX];
+	struct blob_attr *curif, *curaddr;
+	const char *ifname;
+	size_t len = 0;
+	int remif, remaddr;
+	int ifcount = 0;
+
+	snprintf(out, outlen, "-");
+	if (!netinfo)
+		return;
+
+	blobmsg_parse(net_policy, __NET_MAX, tn,
+		      blobmsg_data(netinfo), blobmsg_len(netinfo));
+	if (tn[NET_NAMESPACE] &&
+	    !strcmp(blobmsg_get_string(tn[NET_NAMESPACE]), "host")) {
+		snprintf(out, outlen, "host");
+		return;
+	}
+	if (!tn[NET_INTERFACES])
+		return;
+
+	blobmsg_for_each_attr(curif, tn[NET_INTERFACES], remif)
+		ifcount++;
+
+	blobmsg_for_each_attr(curif, tn[NET_INTERFACES], remif) {
+		blobmsg_parse(net_if_policy, __NET_IF_MAX, ti,
+			      blobmsg_data(curif), blobmsg_len(curif));
+		if (!ti[NET_IF_ADDRESSES])
+			continue;
+
+		ifname = ti[NET_IF_NAME] ?
+			blobmsg_get_string(ti[NET_IF_NAME]) : "?";
+		blobmsg_for_each_attr(curaddr, ti[NET_IF_ADDRESSES], remaddr) {
+			if (blobmsg_type(curaddr) != BLOBMSG_TYPE_STRING)
+				continue;
+
+			len += snprintf(out + len, outlen - len, "%s%s%s%s",
+					len ? "," : "",
+					ifcount > 1 ? ifname : "",
+					ifcount > 1 ? "=" : "",
+					blobmsg_get_string(curaddr));
+			if (len >= outlen)
+				len = outlen - 1;
+		}
+	}
+}
+
 static int uxc_list(void)
 {
-	struct blob_attr *cur, *tb[__CONF_MAX], *ts[__STATE_MAX];
+	struct blob_attr *cur, *tb[__CONF_MAX], *ts[__STATE_MAX], *netinfo;
 	int rem, pass;
 	struct runtime_state *rsstate = NULL;
 	char *name, *bundle, *ocistatus, *status, *created, *tmp;
 	int container_pid;
 	static struct blob_buf buf;
 	void *arr, *obj, *ann;
-	size_t id_w = 2, pid_w = 3, status_w = 6, bundle_w = 6, created_w = 7;
+	size_t id_w = 2, pid_w = 3, status_w = 6, bundle_w = 6, created_w = 7, owner_w = 5;
 	char pidstr[12];
+	char netstr[512];
 
 	if (json_output) {
 		blob_buf_init(&buf, 0);
@@ -1015,10 +1089,11 @@ static int uxc_list(void)
 
 	for (pass = json_output ? 1 : 0; pass < 2; pass++) {
 		if (pass == 1 && !json_output)
-			printf("%-*s %-*s %-*s %-*s %-*s %s\n",
+			printf("%-*s %-*s %-*s %-*s %-*s %-*s %s\n",
 			       (int)id_w, "ID", (int)pid_w, "PID",
 			       (int)status_w, "STATUS", (int)bundle_w, "BUNDLE",
-			       (int)created_w, "CREATED", "OWNER");
+			       (int)created_w, "CREATED", (int)owner_w, "OWNER",
+			       "NET");
 
 		blobmsg_for_each_attr(cur, blob_data(conf.head), rem) {
 			blobmsg_parse(conf_policy, __CONF_MAX, tb,
@@ -1032,6 +1107,7 @@ static int uxc_list(void)
 			ocistatus = NULL;
 			container_pid = 0;
 			created = "-";
+			netinfo = NULL;
 			rsstate = avl_find_element(&runtime, name, rsstate, avl);
 			if (rsstate && rsstate->ocistate) {
 				blobmsg_parse(state_policy, __STATE_MAX, ts,
@@ -1043,6 +1119,7 @@ static int uxc_list(void)
 					container_pid = blobmsg_get_u32(ts[STATE_PID]);
 				if (ts[STATE_BUNDLE])
 					bundle = blobmsg_get_string(ts[STATE_BUNDLE]);
+				netinfo = ts[STATE_NETWORK];
 			}
 			status = ocistatus?:(rsstate && rsstate->running)?"creating":(rsstate?"stopped":"uninitialized");
 
@@ -1074,13 +1151,17 @@ static int uxc_list(void)
 					ann = blobmsg_open_table(&buf, "annotations");
 					blobmsg_close_table(&buf, ann);
 				}
+				if (rsstate && rsstate->ocistate && ts[STATE_NETWORK])
+					blobmsg_add_blob(&buf, ts[STATE_NETWORK]);
 				blobmsg_add_string(&buf, "owner", "root");
 				blobmsg_close_table(&buf, obj);
 			} else {
-				printf("%-*s %-*s %-*s %-*s %-*s %s\n",
+				netinfo_str(netinfo, netstr, sizeof(netstr));
+				printf("%-*s %-*s %-*s %-*s %-*s %-*s %s\n",
 				       (int)id_w, name, (int)pid_w, pidstr,
 				       (int)status_w, status, (int)bundle_w, bundle,
-				       (int)created_w, created, "root");
+				       (int)created_w, created, (int)owner_w, "root",
+				       netstr);
 			}
 		}
 	}
