@@ -44,6 +44,11 @@ let call = function(object, method, data) {
 	return err ? -1 : 0;
 };
 
+let pkg_reload = function(pkg) {
+	ubus.call({ object: "service", method: "event",
+		    data: { type: "config.change", data: { package: pkg } } });
+};
+
 let sidecar_path = function(name) { return "/tmp/run/uvol/.meta/uxc/" + name + ".annotations"; };
 
 let state_dir = "/tmp/run/uvol/.meta/uxc/state";
@@ -484,11 +489,6 @@ let routed_subnet = function(name, ann) {
 	};
 };
 
-let fw_reload = function() {
-	ubus.call({ object: "service", method: "event",
-		    data: { type: "config.change", data: { package: "firewall" } } });
-};
-
 let fw_uci_create = function(name, ann, net) {
 	let czone = contzone(name);
 	let cursor = uci.cursor();
@@ -549,7 +549,7 @@ let fw_uci_create = function(name, ann, net) {
 	}
 
 	cursor.commit("firewall");
-	fw_reload();
+	pkg_reload("firewall");
 	return 0;
 };
 
@@ -568,8 +568,39 @@ let fw_uci_remove = function(name) {
 		cursor.delete("firewall", n);
 	if (length(kill)) {
 		cursor.commit("firewall");
-		fw_reload();
+		pkg_reload("firewall");
 	}
+	return 0;
+};
+
+let ra_uci_create = function(name) {
+	let gw_iface = gwif(name);
+	let cursor = uci.cursor();
+
+	cursor.load("dhcp");
+	if (cursor.get("dhcp", gw_iface))
+		return 0;
+
+	cursor.set("dhcp", gw_iface, "dhcp");
+	cursor.set("dhcp", gw_iface, "interface", gw_iface);
+	cursor.set("dhcp", gw_iface, "ra", "server");
+	cursor.set("dhcp", gw_iface, "dhcpv6", "server");
+	cursor.commit("dhcp");
+	pkg_reload("dhcp");
+	return 0;
+};
+
+let ra_uci_remove = function(name) {
+	let gw_iface = gwif(name);
+	let cursor = uci.cursor();
+
+	cursor.load("dhcp");
+	if (!cursor.get("dhcp", gw_iface))
+		return 0;
+
+	cursor.delete("dhcp", gw_iface);
+	cursor.commit("dhcp");
+	pkg_reload("dhcp");
 	return 0;
 };
 
@@ -594,6 +625,8 @@ let routed_up = function(name, ann, m) {
 		proto: "static",
 		device: vh,
 		ipaddr: [ net.gw_cidr ],
+		ip6assign: 64,
+		ip6ifaceid: "::1",
 		force_link: true,
 		persistent: true,
 		zone: czone,
@@ -612,6 +645,7 @@ let routed_up = function(name, ann, m) {
 		return 1;
 
 	fw_uci_create(name, ann, net);
+	ra_uci_create(name);
 
 	append_injail(name, render_section("lan", "eth0", proto, {
 		ipaddr: net.container,
@@ -629,6 +663,7 @@ let routed_down = function(name) {
 	let gw_iface = gwif(name);
 
 	fw_uci_remove(name);
+	ra_uci_remove(name);
 	call("network.interface." + accif(name), "remove", {});
 	call("network.interface." + gw_iface, "remove", {});
 	return 0;
