@@ -630,6 +630,8 @@ enum {
 	STATE_BUNDLE,
 	STATE_ANNOTATIONS,
 	STATE_NETWORK,
+	STATE_CREATED,
+	STATE_ROOTFS,
 	__STATE_MAX,
 };
 
@@ -641,6 +643,8 @@ static const struct blobmsg_policy state_policy[__STATE_MAX] = {
 	[STATE_BUNDLE] = { .name = "bundle", .type = BLOBMSG_TYPE_STRING },
 	[STATE_ANNOTATIONS] = { .name = "annotations", .type = BLOBMSG_TYPE_TABLE },
 	[STATE_NETWORK] = { .name = "org.openwrt.network", .type = BLOBMSG_TYPE_TABLE },
+	[STATE_CREATED] = { .name = "created", .type = BLOBMSG_TYPE_STRING },
+	[STATE_ROOTFS] = { .name = "rootfs", .type = BLOBMSG_TYPE_STRING },
 };
 
 enum {
@@ -1077,7 +1081,7 @@ static int uxc_list(void)
 	struct blob_attr *cur, *tb[__CONF_MAX], *ts[__STATE_MAX], *netinfo;
 	int rem, pass;
 	struct runtime_state *rsstate = NULL;
-	char *name, *bundle, *ocistatus, *status, *created, *tmp;
+	char *name, *bundle, *ocistatus, *status, *created, *rootfs, *tmp;
 	int container_pid;
 	static struct blob_buf buf;
 	void *arr, *obj, *ann;
@@ -1122,6 +1126,7 @@ static int uxc_list(void)
 			ocistatus = NULL;
 			container_pid = 0;
 			created = "-";
+			rootfs = NULL;
 			netinfo = NULL;
 			rsstate = avl_find_element(&runtime, name, rsstate, avl);
 			if (rsstate && rsstate->ocistate) {
@@ -1134,6 +1139,9 @@ static int uxc_list(void)
 					container_pid = blobmsg_get_u32(ts[STATE_PID]);
 				if (ts[STATE_BUNDLE])
 					bundle = blobmsg_get_string(ts[STATE_BUNDLE]);
+				if (ts[STATE_CREATED])
+					created = blobmsg_get_string(ts[STATE_CREATED]);
+				rootfs = ts[STATE_ROOTFS] ? blobmsg_get_string(ts[STATE_ROOTFS]) : NULL;
 				netinfo = ts[STATE_NETWORK];
 			}
 			status = ocistatus?:(rsstate && rsstate->running)?"creating":(rsstate?"stopped":"uninitialized");
@@ -1168,6 +1176,12 @@ static int uxc_list(void)
 				}
 				if (rsstate && rsstate->ocistate && ts[STATE_NETWORK])
 					blobmsg_add_blob(&buf, ts[STATE_NETWORK]);
+				if (rootfs)
+					blobmsg_add_string(&buf, "rootfs", rootfs);
+
+				if (strcmp(created, "-"))
+					blobmsg_add_string(&buf, "created", created);
+
 				blobmsg_add_string(&buf, "owner", "root");
 				blobmsg_close_table(&buf, obj);
 			} else {
