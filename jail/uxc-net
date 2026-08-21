@@ -54,6 +54,8 @@ let sidecar_path = function(name) { return "/tmp/run/uvol/.meta/uxc/" + name + "
 let state_dir = "/tmp/run/uvol/.meta/uxc/state";
 let macstore_dir  = function(name) { return state_dir + "/" + name; };
 let macstore_path = function(name) { return macstore_dir(name) + "/macaddrs"; };
+let autonet_dir  = state_dir + "/autonets";
+let autonet_path = function(net) { return autonet_dir + "/" + net; };
 
 let rand_mac = function() {
 	let f = fs.open("/dev/urandom", "r");
@@ -158,6 +160,13 @@ let parse_backhaul = function(ann) {
 let iface_exists = function(iface) {
 	ubus.call({ object: "network.interface." + iface, method: "status", data: {} });
 	return !ubus.error();
+};
+
+let bridge_members = function(br) {
+	let r = ubus.call({ object: "network.device", method: "status", data: { name: br } });
+	if (ubus.error() || type(r) != "object" || type(r["bridge-members"]) != "array")
+		return -1;
+	return length(r["bridge-members"]);
 };
 
 
@@ -387,7 +396,8 @@ let ensure_network = function(net) {
 	cursor.load("firewall");
 
 	let br = "br-" + net;
-	let dev = cursor.add("network", "device");
+	let dev = net + "_dev";
+	cursor.set("network", dev, "device");
 	cursor.set("network", dev, "name", br);
 	cursor.set("network", dev, "type", "bridge");
 	cursor.set("network", net, "interface");
@@ -405,17 +415,52 @@ let ensure_network = function(net) {
 	cursor.set("dhcp", net, "dhcpv4", "server");
 	cursor.commit("dhcp");
 
-	let zone = cursor.add("firewall", "zone");
-	cursor.set("firewall", zone, "name", net);
-	cursor.set("firewall", zone, "network", net);
-	cursor.set("firewall", zone, "input", "ACCEPT");
-	cursor.set("firewall", zone, "output", "ACCEPT");
-	cursor.set("firewall", zone, "forward", "REJECT");
+	cursor.set("firewall", net, "zone");
+	cursor.set("firewall", net, "name", net);
+	cursor.set("firewall", net, "network", net);
+	cursor.set("firewall", net, "input", "ACCEPT");
+	cursor.set("firewall", net, "output", "ACCEPT");
+	cursor.set("firewall", net, "forward", "REJECT");
 	cursor.commit("firewall");
+
+	fs.mkdir(state_dir, 0700);
+	fs.mkdir(autonet_dir, 0700);
+	let f = fs.open(autonet_path(net), "w");
+	if (f) {
+		f.write(subnet + "\n");
+		f.close();
+	}
 
 	reload_and_wait(net, [ "network", "dhcp", "firewall" ]);
 
 	return 1;
+};
+
+let autonet_remove = function(net) {
+	let cursor;
+
+	if (!fs.stat(autonet_path(net)))
+		return;
+	if (bridge_members("br-" + net) != 0)
+		return;
+
+	cursor = uci.cursor();
+	cursor.load("network");
+	cursor.load("dhcp");
+	cursor.load("firewall");
+	cursor.delete("network", net);
+	cursor.delete("network", net + "_dev");
+	cursor.delete("dhcp", net);
+	cursor.delete("firewall", net);
+	cursor.commit("network");
+	cursor.commit("dhcp");
+	cursor.commit("firewall");
+
+	fs.unlink(autonet_path(net));
+
+	pkg_reload("network");
+	pkg_reload("dhcp");
+	pkg_reload("firewall");
 };
 
 let bridged_up = function(name, ann, attach, m) {
@@ -468,8 +513,10 @@ let bridged_down = function(name, attach) {
 	let vh = host_veth(name);
 
 	call("network.interface." + accif(name), "remove", {});
-	if (attach.network)
+	if (attach.network) {
 		call("network.interface." + attach.network, "remove_device", { name: vh, "link-ext": false });
+		autonet_remove(attach.network);
+	}
 	return 0;
 };
 
@@ -706,13 +753,6 @@ let backhaul_up = function(name, bh, m) {
 		}));
 
 	return 0;
-};
-
-let bridge_members = function(br) {
-	let r = ubus.call({ object: "network.device", method: "status", data: { name: br } });
-	if (ubus.error() || type(r) != "object" || type(r["bridge-members"]) != "array")
-		return -1;
-	return length(r["bridge-members"]);
 };
 
 let backhaul_down = function(name, bh) {
