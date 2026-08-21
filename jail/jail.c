@@ -30,6 +30,7 @@
 #include <poll.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
+#include <arpa/inet.h>
 
 /* musl only defined 15 limit types, make sure all 16 are supported */
 #ifndef RLIMIT_RTTIME
@@ -4671,6 +4672,273 @@ static int handle_start(struct ubus_context *ctx, struct ubus_object *obj,
 	return UBUS_STATUS_OK;
 }
 
+struct netns_ifinfo {
+	int ifindex;
+	char name[IF_NAMESIZE];
+	char mac[18];
+};
+
+struct netns_ifaddr {
+	int ifindex;
+	char cidr[INET6_ADDRSTRLEN + 4];
+};
+
+static int netns_open_sock(pid_t pid)
+{
+	struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+	struct timeval tv = { .tv_sec = 1 };
+	char path[64];
+	int netns_fd, self_fd, sock, saved_err;
+
+	snprintf(path, sizeof(path), "/proc/%d/ns/net", pid);
+	netns_fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (netns_fd < 0)
+		return -1;
+
+	self_fd = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+	if (self_fd < 0) {
+		close(netns_fd);
+		return -1;
+	}
+
+	if (setns(netns_fd, CLONE_NEWNET)) {
+		close(netns_fd);
+		close(self_fd);
+		return -1;
+	}
+
+	sock = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	saved_err = errno;
+	if (setns(self_fd, CLONE_NEWNET))
+		ERROR("cannot return to own network namespace: %m\n");
+	close(netns_fd);
+	close(self_fd);
+	if (sock < 0) {
+		errno = saved_err;
+		return -1;
+	}
+
+	if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		close(sock);
+		return -1;
+	}
+
+	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+	return sock;
+}
+
+static int netns_parse_link(struct nlmsghdr *nh, struct netns_ifinfo **ifaces, size_t *n)
+{
+	struct ifinfomsg *ifi = NLMSG_DATA(nh);
+	struct netns_ifinfo *tmp, *iface;
+	struct rtattr *rta;
+	const uint8_t *hw;
+	int len = nh->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi));
+
+	if (ifi->ifi_flags & IFF_LOOPBACK)
+		return 0;
+
+	tmp = realloc(*ifaces, (*n + 1) * sizeof(*tmp));
+	if (!tmp)
+		return ENOMEM;
+
+	*ifaces = tmp;
+	iface = &tmp[(*n)++];
+	memset(iface, 0, sizeof(*iface));
+	iface->ifindex = ifi->ifi_index;
+
+	for (rta = IFLA_RTA(ifi); RTA_OK(rta, len); rta = RTA_NEXT(rta, len)) {
+		if (rta->rta_type == IFLA_IFNAME) {
+			strncpy(iface->name, RTA_DATA(rta), sizeof(iface->name) - 1);
+		} else if (rta->rta_type == IFLA_ADDRESS && RTA_PAYLOAD(rta) == 6) {
+			hw = RTA_DATA(rta);
+			snprintf(iface->mac, sizeof(iface->mac),
+				 "%02x:%02x:%02x:%02x:%02x:%02x",
+				 hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]);
+		}
+	}
+
+	return 0;
+}
+
+static int netns_parse_addr(struct nlmsghdr *nh, struct netns_ifaddr **addrs, size_t *n)
+{
+	struct ifaddrmsg *ifa = NLMSG_DATA(nh);
+	struct netns_ifaddr *tmp, *addr;
+	struct rtattr *rta, *sel = NULL;
+	char abuf[INET6_ADDRSTRLEN];
+	int len = nh->nlmsg_len - NLMSG_LENGTH(sizeof(*ifa));
+
+	if (ifa->ifa_family != AF_INET && ifa->ifa_family != AF_INET6)
+		return 0;
+
+	for (rta = IFA_RTA(ifa); RTA_OK(rta, len); rta = RTA_NEXT(rta, len)) {
+		if (rta->rta_type == IFA_LOCAL)
+			sel = rta;
+		else if (rta->rta_type == IFA_ADDRESS && !sel)
+			sel = rta;
+	}
+
+	if (!sel || !inet_ntop(ifa->ifa_family, RTA_DATA(sel), abuf, sizeof(abuf)))
+		return 0;
+
+	tmp = realloc(*addrs, (*n + 1) * sizeof(*tmp));
+	if (!tmp)
+		return ENOMEM;
+
+	*addrs = tmp;
+	addr = &tmp[(*n)++];
+	addr->ifindex = ifa->ifa_index;
+	snprintf(addr->cidr, sizeof(addr->cidr), "%s/%u", abuf, ifa->ifa_prefixlen);
+
+	return 0;
+}
+
+static int netns_dump(int sock, int type, struct netns_ifinfo **ifaces, size_t *nifaces,
+		      struct netns_ifaddr **addrs, size_t *naddrs)
+{
+	struct {
+		struct nlmsghdr hdr;
+		struct rtgenmsg gen;
+	} req = {
+		.hdr = {
+			.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtgenmsg)),
+			.nlmsg_type = type,
+			.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP,
+			.nlmsg_seq = type,
+		},
+		.gen = { .rtgen_family = AF_UNSPEC },
+	};
+	struct nlmsghdr *nh;
+	char buf[32768];
+	ssize_t n;
+	int msglen, err;
+
+	if (send(sock, &req, req.hdr.nlmsg_len, 0) < 0)
+		return errno;
+
+	while (1) {
+		n = recv(sock, buf, sizeof(buf), 0);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return errno;
+		}
+		if (n == 0)
+			return EIO;
+
+		msglen = n;
+		for (nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, msglen); nh = NLMSG_NEXT(nh, msglen)) {
+			err = 0;
+			if (nh->nlmsg_type == NLMSG_DONE)
+				return 0;
+			else if (nh->nlmsg_type == NLMSG_ERROR)
+				return EIO;
+			else if (nh->nlmsg_type == RTM_NEWLINK)
+				err = netns_parse_link(nh, ifaces, nifaces);
+			else if (nh->nlmsg_type == RTM_NEWADDR)
+				err = netns_parse_addr(nh, addrs, naddrs);
+			if (err)
+				return err;
+		}
+	}
+}
+
+static void netns_fill_interfaces(struct blob_buf *b, pid_t pid)
+{
+	struct netns_ifinfo *ifaces = NULL;
+	struct netns_ifaddr *addrs = NULL;
+	size_t nifaces = 0, naddrs = 0, i, j;
+	void *a, *t, *aa;
+	int sock;
+
+	sock = netns_open_sock(pid);
+	if (sock < 0)
+		return;
+
+	if (netns_dump(sock, RTM_GETLINK, &ifaces, &nifaces, &addrs, &naddrs) ||
+	    netns_dump(sock, RTM_GETADDR, &ifaces, &nifaces, &addrs, &naddrs))
+		goto out;
+
+	a = blobmsg_open_array(b, "interfaces");
+	for (i = 0; i < nifaces; i++) {
+		t = blobmsg_open_table(b, NULL);
+		blobmsg_add_string(b, "name", ifaces[i].name);
+		if (ifaces[i].mac[0])
+			blobmsg_add_string(b, "mac", ifaces[i].mac);
+		aa = blobmsg_open_array(b, "addresses");
+		for (j = 0; j < naddrs; j++)
+			if (addrs[j].ifindex == ifaces[i].ifindex)
+				blobmsg_add_string(b, NULL, addrs[j].cidr);
+		blobmsg_close_array(b, aa);
+		blobmsg_close_table(b, t);
+	}
+	blobmsg_close_array(b, a);
+
+out:
+	free(ifaces);
+	free(addrs);
+	close(sock);
+}
+
+static const char *annotation_get(struct blob_attr *attrs, const char *key)
+{
+	struct blob_attr *cur;
+	int rem;
+
+	if (!attrs)
+		return NULL;
+
+	blobmsg_for_each_attr(cur, attrs, rem)
+		if (blobmsg_type(cur) == BLOBMSG_TYPE_STRING &&
+		    !strcmp(blobmsg_name(cur), key))
+			return blobmsg_get_string(cur);
+
+	return NULL;
+}
+
+static void oci_state_fill_network(struct blob_buf *b)
+{
+	struct blob_buf sidecar = { 0 };
+	char path[128];
+	const char *mode, *attach;
+	void *c;
+
+	if (opts.setns.net != -1)
+		mode = "joined";
+	else if (opts.namespace & CLONE_NEWNET)
+		mode = "private";
+	else
+		mode = "host";
+
+	c = blobmsg_open_table(b, "org.openwrt.network");
+	blobmsg_add_string(b, "namespace", mode);
+
+	blob_buf_init(&sidecar, 0);
+	snprintf(path, sizeof(path), "/tmp/run/uvol/.meta/uxc/%s.annotations", opts.name);
+	blobmsg_add_json_from_file(&sidecar, path);
+
+	attach = annotation_get(sidecar.head, "org.openwrt.network.attach");
+	if (!attach)
+		attach = annotation_get(opts.annotations, "org.openwrt.network.attach");
+	if (attach && !*attach)
+		attach = NULL;
+	if (!attach && (opts.namespace & CLONE_NEWNET))
+		attach = "none";
+	if (attach)
+		blobmsg_add_string(b, "attach", attach);
+	blob_buf_free(&sidecar);
+
+	if (strcmp(mode, "host") && jail_running &&
+	    (jail_oci_state == OCI_STATE_CREATED ||
+	     jail_oci_state == OCI_STATE_RUNNING ||
+	     jail_oci_state == OCI_STATE_PAUSED))
+		netns_fill_interfaces(b, jail_process.pid);
+
+	blobmsg_close_table(b, c);
+}
+
 static struct blob_buf bb;
 static void oci_state_fill(struct blob_buf *b)
 {
@@ -4753,6 +5021,7 @@ static int handle_state(struct ubus_context *ctx, struct ubus_object *obj,
 {
 	blob_buf_init(&bb, 0);
 	oci_state_fill(&bb);
+	oci_state_fill_network(&bb);
 	ubus_send_reply(ctx, req, bb.head);
 
 	return UBUS_STATUS_OK;
