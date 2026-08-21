@@ -207,6 +207,7 @@ static void run_netifd(struct uloop_timeout *t)
 	blobmsg_add_string(&req, "/bin/cat", "0");
 	blobmsg_add_string(&req, "/bin/ipcalc.sh", "0");
 	blobmsg_add_string(&req, "/bin/kill", "0");
+	blobmsg_add_string(&req, "/bin/sed", "0");
 	blobmsg_add_string(&req, "/bin/ubus", "0");
 	blobmsg_add_string(&req, "/etc/hotplug.d", "0");
 	blobmsg_add_string(&req, "/lib/config/uci.sh", "0");
@@ -228,6 +229,7 @@ static void run_netifd(struct uloop_timeout *t)
 	blobmsg_add_string(&req, "/sbin/hotplug-call", "0");
 	blobmsg_add_string(&req, "/sbin/uci", "0");
 	blobmsg_add_string(&req, "/sbin/udhcpc", "0");
+	blobmsg_add_string(&req, "/usr/sbin/odhcp6c", "0");
 	blobmsg_close_table(&req, mount);
 
 	blobmsg_add_u8(&req, "log", 1);
