@@ -847,28 +847,14 @@ service_handle_validate(struct ubus_context *ctx, struct ubus_object *obj,
 	return 0;
 }
 
-static int
-service_get_data(struct ubus_context *ctx, struct ubus_object *obj,
-		 struct ubus_request_data *req, const char *method,
-		 struct blob_attr *msg)
+static void
+service_dump_data(struct avl_tree *tree, const char *name, const char *instance,
+		  const char *type)
 {
 	struct service_instance *in;
 	struct service *s;
-	struct blob_attr *tb[__DATA_MAX];
-	const char *name = NULL;
-	const char *instance = NULL;
-	const char *type = NULL;
 
-	blobmsg_parse(get_data_policy, __DATA_MAX, tb, blobmsg_data(msg), blobmsg_data_len(msg));
-	if (tb[DATA_NAME])
-		name = blobmsg_data(tb[DATA_NAME]);
-	if (tb[DATA_INSTANCE])
-		instance = blobmsg_data(tb[DATA_INSTANCE]);
-	if (tb[DATA_TYPE])
-		type = blobmsg_data(tb[DATA_TYPE]);
-
-	blob_buf_init(&b, 0);
-	avl_for_each_element(&services, s, avl) {
+	avl_for_each_element(tree, s, avl) {
 		void *cs = NULL;
 		void *ci = NULL;
 		struct blobmsg_list_node *var;
@@ -917,6 +903,29 @@ service_get_data(struct ubus_context *ctx, struct ubus_object *obj,
 		if (cs)
 			blobmsg_close_table(&b, cs);
 	}
+}
+
+static int
+service_get_data(struct ubus_context *ctx, struct ubus_object *obj,
+		 struct ubus_request_data *req, const char *method,
+		 struct blob_attr *msg)
+{
+	struct blob_attr *tb[__DATA_MAX];
+	const char *name = NULL;
+	const char *instance = NULL;
+	const char *type = NULL;
+
+	blobmsg_parse(get_data_policy, __DATA_MAX, tb, blobmsg_data(msg), blobmsg_data_len(msg));
+	if (tb[DATA_NAME])
+		name = blobmsg_data(tb[DATA_NAME]);
+	if (tb[DATA_INSTANCE])
+		instance = blobmsg_data(tb[DATA_INSTANCE]);
+	if (tb[DATA_TYPE])
+		type = blobmsg_data(tb[DATA_TYPE]);
+
+	blob_buf_init(&b, 0);
+	service_dump_data(&services, name, instance, type);
+	service_dump_data(&containers, name, instance, type);
 
 	ubus_send_reply(ctx, req, b.head);
 	return 0;
@@ -942,6 +951,9 @@ service_handle_set_data(struct ubus_context *ctx, struct ubus_object *obj,
 	name = blobmsg_get_string(tb[SET_DATA_NAME]);
 
 	s = avl_find_element(&services, name, s, avl);
+	if (!s)
+		s = avl_find_element(&containers, name, s, avl);
+
 	if (!s)
 		return UBUS_STATUS_NOT_FOUND;
 
