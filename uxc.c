@@ -1239,6 +1239,8 @@ static int uvol_status(const char *vol);
 static const char *uvol_volume_name(const char *path);
 static int run_uvol(const char *action, const char *vol);
 static int provision_rw_uvol(const char *volname, const char *size);
+static bool uvol_meta_pending(void);
+static bool uvol_backend_pending(void);
 static int provision_data_volumes(const char *container, struct blob_attr *vols,
 				  struct blob_buf *req);
 
@@ -2213,7 +2215,7 @@ static int uxc_boot(const char *mountpoint)
 			if (checkvolumes(usettings->volumes))
 				continue;
 
-		if ((tb[CONF_DATA_VOLUMES] || tb[CONF_OVERLAY_SIZE]) && uvol_status(".meta"))
+		if ((tb[CONF_DATA_VOLUMES] || tb[CONF_OVERLAY_SIZE]) && uvol_meta_pending())
 			continue;
 
 		name = strdup(blobmsg_get_string(tb[CONF_NAME]));
@@ -2223,6 +2225,11 @@ static int uxc_boot(const char *mountpoint)
 		}
 
 		imgvol = uvol_volume_name(blobmsg_get_string(tb[CONF_PATH]));
+		if (imgvol && uvol_backend_pending()) {
+			free(name);
+			continue;
+		}
+
 		if (imgvol && uvol_status(imgvol)) {
 			ERROR("uxc: %s image %s missing (interrupted upgrade?); run 'apk fix %s'\n",
 			      name, imgvol, name);
@@ -2237,6 +2244,148 @@ static int uxc_boot(const char *mountpoint)
 	}
 
 	return ret;
+}
+
+#define UVOL_EXEC_TIMEOUT_DEFAULT	120
+#define UVOL_TIMEOUT_MARGIN_MS		10000
+
+enum {
+	UVOL_CODE,
+	UVOL_READY,
+	UVOL_META,
+	__UVOL_MAX,
+};
+
+static const struct blobmsg_policy uvol_policy[__UVOL_MAX] = {
+	[UVOL_CODE] = { .name = "code", .type = BLOBMSG_TYPE_INT32 },
+	[UVOL_READY] = { .name = "ready", .type = BLOBMSG_TYPE_BOOL },
+	[UVOL_META] = { .name = "meta", .type = BLOBMSG_TYPE_BOOL },
+};
+
+struct uvol_reply {
+	int code;
+	bool answered;
+	bool ready;
+	bool meta;
+};
+
+static void uvol_cb(struct ubus_request *req, int type, struct blob_attr *msg)
+{
+	struct blob_attr *tb[__UVOL_MAX];
+	struct uvol_reply *reply = req->priv;
+
+	if (!msg)
+		return;
+
+	blobmsg_parse(uvol_policy, __UVOL_MAX, tb, blob_data(msg), blob_len(msg));
+
+	reply->answered = true;
+
+	if (tb[UVOL_CODE])
+		reply->code = blobmsg_get_u32(tb[UVOL_CODE]);
+
+	if (tb[UVOL_READY])
+		reply->ready = blobmsg_get_bool(tb[UVOL_READY]);
+
+	if (tb[UVOL_META])
+		reply->meta = blobmsg_get_bool(tb[UVOL_META]);
+}
+
+static void uci_value_cb(struct ubus_request *req, int type, struct blob_attr *msg)
+{
+	static const struct blobmsg_policy pol = {
+		.name = "value", .type = BLOBMSG_TYPE_STRING
+	};
+	struct blob_attr *tb;
+
+	if (!msg)
+		return;
+
+	blobmsg_parse(&pol, 1, &tb, blob_data(msg), blob_len(msg));
+	if (tb)
+		*(int *)req->priv = atoi(blobmsg_get_string(tb));
+}
+
+static uint32_t uvol_ubus_id(void)
+{
+	static bool looked_up;
+	static uint32_t id;
+
+	if (!looked_up) {
+		if (ubus_lookup_id(ctx, "uvol", &id))
+			id = 0;
+
+		looked_up = true;
+	}
+
+	return id;
+}
+
+static bool uvol_ubus_available(void)
+{
+	return uvol_ubus_id() != 0;
+}
+
+static int uvol_timeout(void)
+{
+	static struct blob_buf req;
+	static int timeout_ms;
+	int secs = UVOL_EXEC_TIMEOUT_DEFAULT;
+	uint32_t id;
+
+	if (timeout_ms)
+		return timeout_ms;
+
+	if (!ubus_lookup_id(ctx, "uci", &id)) {
+		blob_buf_init(&req, 0);
+		blobmsg_add_string(&req, "config", "rpcd");
+		blobmsg_add_string(&req, "section", "@rpcd[0]");
+		blobmsg_add_string(&req, "option", "timeout");
+		ubus_invoke(ctx, id, "get", req.head, uci_value_cb, &secs, 3000);
+	}
+
+	if (secs < 1 || secs > 600)
+		secs = UVOL_EXEC_TIMEOUT_DEFAULT;
+
+	timeout_ms = secs * 1000 + UVOL_TIMEOUT_MARGIN_MS;
+
+	return timeout_ms;
+}
+
+static int uvol_call(const char *method, struct blob_attr *args,
+		     struct uvol_reply *reply)
+{
+	static struct blob_buf empty;
+
+	memset(reply, 0, sizeof(*reply));
+
+	if (!args) {
+		blob_buf_init(&empty, 0);
+		args = empty.head;
+	}
+
+	if (ubus_invoke(ctx, uvol_ubus_id(), method, args, uvol_cb, reply,
+			uvol_timeout()))
+		return -EIO;
+
+	if (!reply->answered)
+		return -EIO;
+
+	return 0;
+}
+
+static int uvol_call_volume(const char *method, const char *vol)
+{
+	static struct blob_buf req;
+	struct uvol_reply reply;
+
+	blob_buf_init(&req, 0);
+	blobmsg_add_string(&req, "name", vol);
+
+	if (uvol_call(method, req.head, &reply))
+		return -EIO;
+
+	return reply.code;
 }
 
 static const char *uvol_volume_name(const char *path)
@@ -2278,29 +2427,92 @@ static int run_uvol(const char *action, const char *vol)
 {
 	char *argv[] = { "/usr/sbin/uvol", (char *)action, (char *)vol, NULL };
 
+	if (uvol_ubus_available())
+		return uvol_call_volume(action, vol);
+
 	return run_uvol_argv(argv);
 }
 
-static int run_uvol_create(const char *vol, const char *size, const char *type)
+static int run_uvol_create(const char *vol, long long size, const char *mode)
 {
+	char sizebytes[32];
 	char *argv[] = { "/usr/sbin/uvol", "create", (char *)vol,
-			 (char *)size, (char *)type, NULL };
+			 sizebytes, (char *)mode, NULL };
+	static struct blob_buf req;
+	struct uvol_reply reply;
 
-	return run_uvol_argv(argv);
+	snprintf(sizebytes, sizeof(sizebytes), "%lld", size);
+
+	if (!uvol_ubus_available())
+		return run_uvol_argv(argv);
+
+	blob_buf_init(&req, 0);
+	blobmsg_add_string(&req, "name", vol);
+	blobmsg_add_u64(&req, "size", size);
+	blobmsg_add_string(&req, "mode", mode);
+
+	if (uvol_call("create", req.head, &reply))
+		return -EIO;
+
+	return reply.code;
 }
 
-static int run_uvol_resize(const char *vol, const char *size)
+static int run_uvol_resize(const char *vol, long long size)
 {
-	char *argv[] = { "/usr/sbin/uvol", "resize", (char *)vol, (char *)size, NULL };
+	char sizebytes[32];
+	char *argv[] = { "/usr/sbin/uvol", "resize", (char *)vol, sizebytes, NULL };
+	static struct blob_buf req;
+	struct uvol_reply reply;
 
-	return run_uvol_argv(argv);
+	snprintf(sizebytes, sizeof(sizebytes), "%lld", size);
+
+	if (!uvol_ubus_available())
+		return run_uvol_argv(argv);
+
+	blob_buf_init(&req, 0);
+	blobmsg_add_string(&req, "name", vol);
+	blobmsg_add_u64(&req, "size", size);
+
+	if (uvol_call("resize", req.head, &reply))
+		return -EIO;
+
+	return reply.code;
 }
 
 static int uvol_status(const char *vol)
 {
 	char *argv[] = { "/usr/sbin/uvol", "status", (char *)vol, NULL };
 
+	if (uvol_ubus_available())
+		return uvol_call_volume("status", vol);
+
 	return run_uvol_argv(argv);
+}
+
+static bool uvol_meta_pending(void)
+{
+	struct uvol_reply reply;
+
+	if (!uvol_ubus_available())
+		return uvol_status(".meta") != 0;
+
+	if (uvol_call("ready", NULL, &reply))
+		return true;
+
+	return !reply.meta;
+}
+
+static bool uvol_backend_pending(void)
+{
+	struct uvol_reply reply;
+
+	if (!uvol_ubus_available())
+		return false;
+
+	if (uvol_call("ready", NULL, &reply))
+		return true;
+
+	return !reply.ready;
 }
 
 static long long parse_size_bytes(const char *s)
@@ -2339,9 +2551,23 @@ static long long parse_size_bytes(const char *s)
 	return v;
 }
 
+static int create_rw_uvol(const char *volname, long long bytes)
+{
+	int ret, st;
+
+	ret = run_uvol_create(volname, bytes, "rw");
+	if (ret != -EIO)
+		return ret;
+
+	st = uvol_status(volname);
+	if (st != 16 && st != 22)
+		return ret;
+
+	return run_uvol_create(volname, bytes, "rw");
+}
+
 static int provision_rw_uvol(const char *volname, const char *size)
 {
-	char sizebytes[32];
 	long long bytes;
 	int st, rr;
 
@@ -2350,16 +2576,15 @@ static int provision_rw_uvol(const char *volname, const char *size)
 		fprintf(stderr, "uxc: invalid size '%s' for volume %s\n", size, volname);
 		return -EINVAL;
 	}
-	snprintf(sizebytes, sizeof(sizebytes), "%lld", bytes);
 
 	st = uvol_status(volname);
 	if (st == 2) {
-		if (run_uvol_create(volname, sizebytes, "rw")) {
+		if (create_rw_uvol(volname, bytes)) {
 			fprintf(stderr, "uxc: failed to create volume %s\n", volname);
 			return -EIO;
 		}
 	} else {
-		rr = run_uvol_resize(volname, sizebytes);
+		rr = run_uvol_resize(volname, bytes);
 		if (rr == 22)
 			fprintf(stderr, "uxc: volume %s larger than requested, kept\n", volname);
 		else if (rr) {
