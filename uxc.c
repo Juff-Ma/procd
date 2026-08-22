@@ -1476,8 +1476,10 @@ static int uxc_create(char *name, bool immediately, const char *console_socket,
 	path = blobmsg_get_string(tb[CONF_PATH]);
 
 	imgvol = uvol_volume_name(path);
-	if (imgvol)
-		run_uvol("up", imgvol);
+	if (imgvol && run_uvol("up", imgvol)) {
+		fprintf(stderr, "uxc: failed to activate image volume %s\n", imgvol);
+		return -EIO;
+	}
 
 	if (tb[CONF_PIDFILE])
 		pidfile = blobmsg_get_string(tb[CONF_PIDFILE]);
