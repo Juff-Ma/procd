@@ -18,6 +18,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <getopt.h>
 #include <sys/file.h>
 #include <glob.h>
@@ -2432,15 +2433,24 @@ static bool uxc_registered(const char *name)
 	return false;
 }
 
+static int purge_cb(const char *path, const struct stat *sb, int typeflag,
+		    struct FTW *ftwbuf)
+{
+	return remove(path);
+}
+
 static void reconcile_purge(const char *name, const char *statedir)
 {
-	char *rm[] = { "/bin/rm", "-rf", (char *)statedir, NULL };
 	char path[PATH_MAX];
 
 	snprintf(path, sizeof(path), "%s/settings/%s.json", UXC_VOL_CONFDIR, name);
 	unlink(path);
 
-	run_uvol_argv(rm);
+	if (nftw(statedir, purge_cb, 16, FTW_DEPTH | FTW_PHYS)) {
+		fprintf(stderr, "uxc: reconcile: could not purge state for %s\n", name);
+		return;
+	}
+
 	fprintf(stderr, "uxc: reconcile: purged orphaned state for %s\n", name);
 }
 
