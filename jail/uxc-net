@@ -2,8 +2,6 @@
 
 let fs = require("fs");
 let ubus = require("ubus");
-let uci = require("uci");
-let uloop = require("uloop");
 
 let fnv1a = function(s) {
 	let h = 2166136261, i;
@@ -49,13 +47,52 @@ let pkg_reload = function(pkg) {
 		    data: { type: "config.change", data: { package: pkg } } });
 };
 
+let quiet_call = function(object, method, data) {
+	ubus.call({ object: object, method: method, data: data });
+	return ubus.error() ? -1 : 0;
+};
+
+let autonet_service = "uxc-net";
+
+let icmpv6_types = [
+	"echo-request", "echo-reply", "destination-unreachable",
+	"packet-too-big", "time-exceeded", "bad-header",
+	"unknown-header-type", "router-solicitation",
+	"neighbour-solicitation", "router-advertisement",
+	"neighbour-advertisement",
+];
+
+let publish = function(name, fw, dh) {
+	let data = {};
+
+	if (length(fw))
+		data.firewall = fw;
+	if (length(dh))
+		data.dhcp = dh;
+
+	if (call("service", "set_data", { name: name, instance: name, data: data }))
+		return 1;
+
+	pkg_reload("firewall");
+	pkg_reload("dhcp");
+
+	return 0;
+};
+
+let withdraw = function(name) {
+	quiet_call("service", "set_data", { name: name, instance: name, data: {} });
+
+	pkg_reload("firewall");
+	pkg_reload("dhcp");
+
+	return 0;
+};
+
 let sidecar_path = function(name) { return "/tmp/run/uvol/.meta/uxc/" + name + ".annotations"; };
 
 let state_dir = "/tmp/run/uvol/.meta/uxc/state";
 let macstore_dir  = function(name) { return state_dir + "/" + name; };
 let macstore_path = function(name) { return macstore_dir(name) + "/macaddrs"; };
-let autonet_dir  = state_dir + "/autonets";
-let autonet_path = function(net) { return autonet_dir + "/" + net; };
 
 let rand_mac = function() {
 	let f = fs.open("/dev/urandom", "r");
@@ -343,124 +380,105 @@ let pick_subnet = function() {
 	return null;
 };
 
-let reload_and_wait = function(iface, pkgs) {
-	let obj = "network.interface." + iface;
-	let conn = ubus.connect();
-	let emit = function() {
-		for (let p in pkgs)
-			ubus.call({ object: "service", method: "event",
-				    data: { type: "config.change", data: { package: p } } });
-	};
+let autonet_list = function() {
+	let d = ubus.call({ object: "service", method: "get_data",
+			    data: { name: autonet_service, type: "firewall" } });
+	let nets = [], svc, k, v, sec;
 
-	if (!conn) {
-		emit();
-		return;
+	if (ubus.error() || type(d) != "object")
+		return nets;
+
+	svc = d[autonet_service];
+	if (type(svc) != "object")
+		return nets;
+
+	for (k, v in svc) {
+		if (type(v) != "object" || type(v.firewall) != "array")
+			continue;
+		for (sec in v.firewall)
+			if (sec.type == "zone" && sec.name)
+				push(nets, sec.name);
 	}
 
-	uloop.init();
-	let ready = false;
-	let lst = conn.listener("ubus.object.add", function(ev, data) {
-		if (type(data) == "object" && data.path == obj) {
-			ready = true;
-			uloop.end();
-		}
-	});
+	return nets;
+};
 
-	emit();
+let autonet_publish = function(nets) {
+	let fw = [], dh = [], net;
 
-	ubus.call({ object: obj, method: "status", data: {} });
-	if (!ubus.error())
-		ready = true;
-
-	if (!ready) {
-		let t = uloop.timer(30000, function() { uloop.end(); });
-		uloop.run();
-		t.cancel();
+	for (net in nets) {
+		push(fw, {
+			type: "zone",
+			name: net,
+			network: [ net ],
+			input: "ACCEPT",
+			output: "ACCEPT",
+			forward: "REJECT",
+		});
+		push(dh, {
+			type: "dhcp",
+			interface: net,
+			start: 100,
+			limit: 150,
+			leasetime: "12h",
+			dhcpv4: "server",
+		});
 	}
 
-	lst.remove();
-	conn.disconnect();
+	if (length(nets))
+		call("service", "set", { name: autonet_service,
+					 data: { firewall: fw, dhcp: dh } });
+	else
+		quiet_call("service", "delete", { name: autonet_service });
+
+	pkg_reload("firewall");
+	pkg_reload("dhcp");
 };
 
 let ensure_network = function(net) {
-	if (iface_exists(net))
-		return 0;
+	let br = "br-" + net;
+	let nets = autonet_list();
+	let subnet;
 
-	let subnet = pick_subnet();
+	if (iface_exists(net))
+		return (net in nets) ? 1 : 0;
+
+	subnet = pick_subnet();
 	if (!subnet)
 		return 2;
 
-	let cursor = uci.cursor();
-	cursor.load("network");
-	cursor.load("dhcp");
-	cursor.load("firewall");
+	if (call("network", "create_device", { name: br, type: "bridge" }))
+		return 2;
 
-	let br = "br-" + net;
-	let dev = net + "_dev";
-	cursor.set("network", dev, "device");
-	cursor.set("network", dev, "name", br);
-	cursor.set("network", dev, "type", "bridge");
-	cursor.set("network", net, "interface");
-	cursor.set("network", net, "proto", "static");
-	cursor.set("network", net, "device", br);
-	cursor.set("network", net, "ipaddr", subnet + ".1");
-	cursor.set("network", net, "netmask", "255.255.255.0");
-	cursor.commit("network");
-
-	cursor.set("dhcp", net, "dhcp");
-	cursor.set("dhcp", net, "interface", net);
-	cursor.set("dhcp", net, "start", "100");
-	cursor.set("dhcp", net, "limit", "150");
-	cursor.set("dhcp", net, "leasetime", "12h");
-	cursor.set("dhcp", net, "dhcpv4", "server");
-	cursor.commit("dhcp");
-
-	cursor.set("firewall", net, "zone");
-	cursor.set("firewall", net, "name", net);
-	cursor.set("firewall", net, "network", net);
-	cursor.set("firewall", net, "input", "ACCEPT");
-	cursor.set("firewall", net, "output", "ACCEPT");
-	cursor.set("firewall", net, "forward", "REJECT");
-	cursor.commit("firewall");
-
-	fs.mkdir(state_dir, 0700);
-	fs.mkdir(autonet_dir, 0700);
-	let f = fs.open(autonet_path(net), "w");
-	if (f) {
-		f.write(subnet + "\n");
-		f.close();
+	if (call("network", "add_dynamic", {
+		name: net,
+		proto: "static",
+		device: br,
+		ipaddr: [ subnet + ".1/24" ],
+		persistent: true,
+	})) {
+		quiet_call("network", "delete_device", { name: br });
+		return 2;
 	}
 
-	reload_and_wait(net, [ "network", "dhcp", "firewall" ]);
+	push(nets, net);
+	autonet_publish(nets);
 
 	return 1;
 };
 
 let autonet_remove = function(net) {
-	let cursor;
+	let nets = autonet_list();
 
-	if (!fs.stat(autonet_path(net)))
+	if (!(net in nets))
 		return;
-	if (bridge_members("br-" + net) != 0)
+	if (bridge_members("br-" + net) > 0)
 		return;
 
-	cursor = uci.cursor();
-	cursor.load("network");
-	cursor.load("dhcp");
-	cursor.load("firewall");
-	cursor.delete("network", net);
-	cursor.delete("network", net + "_dev");
-	cursor.delete("dhcp", net);
-	cursor.delete("firewall", net);
-	cursor.commit("network");
-	cursor.commit("dhcp");
-	cursor.commit("firewall");
+	autonet_publish(filter(nets, function(n) { return n != net; }));
 
-	fs.unlink(autonet_path(net));
-
-	pkg_reload("network");
-	pkg_reload("dhcp");
-	pkg_reload("firewall");
+	call("network.interface." + net, "remove", {});
+	quiet_call("network", "delete_device", { name: "br-" + net });
 };
 
 let bridged_up = function(name, ann, attach, m) {
@@ -536,119 +554,108 @@ let routed_subnet = function(name, ann) {
 	};
 };
 
-let fw_uci_create = function(name, ann, net) {
+let fw_specs = function(name, ann, net, proto6) {
 	let czone = contzone(name);
-	let cursor = uci.cursor();
-	let i, list, m, sec;
+	let list = [], i, m, sub;
 
-	cursor.load("firewall");
-	if (cursor.get("firewall", czone))
-		return 0;
+	push(list, {
+		type: "zone",
+		name: czone,
+		network: [ gwif(name) ],
+		input: "DROP",
+		output: "ACCEPT",
+		forward: "DROP",
+	});
 
-	cursor.set("firewall", czone, "zone");
-	cursor.set("firewall", czone, "name", czone);
-	cursor.set("firewall", czone, "network", gwif(name));
-	cursor.set("firewall", czone, "input", "DROP");
-	cursor.set("firewall", czone, "output", "ACCEPT");
-	cursor.set("firewall", czone, "forward", "DROP");
-
-	list = csv(ann["org.openwrt.network.egress"]);
-	for (i = 0; i < length(list); i++) {
-		sec = czone + "f" + i;
-		cursor.set("firewall", sec, "forwarding");
-		cursor.set("firewall", sec, "src", czone);
-		cursor.set("firewall", sec, "dest", zone_of(list[i]));
-	}
-
-	list = csv(ann["org.openwrt.network.ingress"]);
-	for (i = 0; i < length(list); i++) {
-		m = match(list[i], /^([A-Za-z0-9_:]+):(tcp|udp)\/([0-9]+(-[0-9]+)?)$/);
-		if (!m) {
-			warn(sprintf("uxc-net: ignoring bad ingress '%s'\n", list[i]));
-			continue;
-		}
-		sec = czone + "r" + i;
-		cursor.set("firewall", sec, "redirect");
-		cursor.set("firewall", sec, "name", czone + "-in" + i);
-		cursor.set("firewall", sec, "src", zone_of(m[1]));
-		cursor.set("firewall", sec, "dest", czone);
-		cursor.set("firewall", sec, "proto", m[2]);
-		cursor.set("firewall", sec, "src_dport", m[3]);
-		cursor.set("firewall", sec, "dest_ip", net.container);
-		cursor.set("firewall", sec, "dest_port", m[3]);
-		cursor.set("firewall", sec, "target", "DNAT");
-	}
-
-	list = csv(ann["org.openwrt.network.host"]);
-	for (i = 0; i < length(list); i++) {
-		m = match(list[i], /^(tcp|udp)\/([0-9]+(-[0-9]+)?)$/);
-		if (!m) {
-			warn(sprintf("uxc-net: ignoring bad host port '%s'\n", list[i]));
-			continue;
-		}
-		sec = czone + "h" + i;
-		cursor.set("firewall", sec, "rule");
-		cursor.set("firewall", sec, "name", czone + "-host" + i);
-		cursor.set("firewall", sec, "src", czone);
-		cursor.set("firewall", sec, "proto", m[1]);
-		cursor.set("firewall", sec, "dest_port", m[2]);
-		cursor.set("firewall", sec, "target", "ACCEPT");
-	}
-
-	cursor.commit("firewall");
-	pkg_reload("firewall");
-	return 0;
-};
-
-let fw_uci_remove = function(name) {
-	let czone = contzone(name);
-	let cursor = uci.cursor();
-	let kill = [], t;
-
-	cursor.load("firewall");
-	for (t in [ "zone", "forwarding", "redirect", "rule" ])
-		cursor.foreach("firewall", t, function(s) {
-			if (index(s[".name"], czone) == 0)
-				push(kill, s[".name"]);
+	sub = csv(ann["org.openwrt.network.egress"]);
+	for (i = 0; i < length(sub); i++)
+		push(list, {
+			type: "forwarding",
+			src: czone,
+			dest: zone_of(sub[i]),
 		});
-	for (let n in kill)
-		cursor.delete("firewall", n);
-	if (length(kill)) {
-		cursor.commit("firewall");
-		pkg_reload("firewall");
+
+	sub = csv(ann["org.openwrt.network.ingress"]);
+	for (i = 0; i < length(sub); i++) {
+		m = match(sub[i], /^([A-Za-z0-9_:]+):(tcp|udp)\/([0-9]+(-[0-9]+)?)$/);
+		if (!m) {
+			warn(sprintf("uxc-net: ignoring bad ingress '%s'\n", sub[i]));
+			continue;
+		}
+		push(list, {
+			type: "redirect",
+			name: czone + "-in" + i,
+			src: zone_of(m[1]),
+			dest: czone,
+			proto: m[2],
+			src_dport: m[3],
+			dest_ip: net.container,
+			dest_port: m[3],
+			target: "DNAT",
+		});
 	}
-	return 0;
+
+	sub = csv(ann["org.openwrt.network.host"]);
+	for (i = 0; i < length(sub); i++) {
+		m = match(sub[i], /^(tcp|udp)\/([0-9]+(-[0-9]+)?)$/);
+		if (!m) {
+			warn(sprintf("uxc-net: ignoring bad host port '%s'\n", sub[i]));
+			continue;
+		}
+		push(list, {
+			type: "rule",
+			name: czone + "-host" + i,
+			src: czone,
+			proto: m[1],
+			dest_port: m[2],
+			target: "ACCEPT",
+		});
+	}
+
+	push(list, {
+		type: "rule",
+		name: czone + "-dns",
+		src: czone,
+		proto: [ "tcp", "udp" ],
+		dest_port: "53",
+		target: "ACCEPT",
+	});
+
+	if (proto6 != "none") {
+		push(list, {
+			type: "rule",
+			name: czone + "-icmpv6",
+			src: czone,
+			proto: "icmp",
+			family: "ipv6",
+			icmp_type: icmpv6_types,
+			limit: "1000/sec",
+			target: "ACCEPT",
+		});
+	}
+
+	if (proto6 == "dhcpv6") {
+		push(list, {
+			type: "rule",
+			name: czone + "-dhcpv6",
+			src: czone,
+			proto: "udp",
+			family: "ipv6",
+			dest_port: "547",
+			target: "ACCEPT",
+		});
+	}
+
+	return list;
 };
 
-let ra_uci_create = function(name) {
-	let gw_iface = gwif(name);
-	let cursor = uci.cursor();
-
-	cursor.load("dhcp");
-	if (cursor.get("dhcp", gw_iface))
-		return 0;
-
-	cursor.set("dhcp", gw_iface, "dhcp");
-	cursor.set("dhcp", gw_iface, "interface", gw_iface);
-	cursor.set("dhcp", gw_iface, "ra", "server");
-	cursor.set("dhcp", gw_iface, "dhcpv6", "server");
-	cursor.commit("dhcp");
-	pkg_reload("dhcp");
-	return 0;
-};
-
-let ra_uci_remove = function(name) {
-	let gw_iface = gwif(name);
-	let cursor = uci.cursor();
-
-	cursor.load("dhcp");
-	if (!cursor.get("dhcp", gw_iface))
-		return 0;
-
-	cursor.delete("dhcp", gw_iface);
-	cursor.commit("dhcp");
-	pkg_reload("dhcp");
-	return 0;
+let dhcp_specs = function(name) {
+	return [ {
+		type: "dhcp",
+		interface: gwif(name),
+		ra: "server",
+		dhcpv6: "server",
+	} ];
 };
 
 let routed_up = function(name, ann, m) {
@@ -691,8 +698,7 @@ let routed_up = function(name, ann, m) {
 	}))
 		return 1;
 
-	fw_uci_create(name, ann, net);
-	ra_uci_create(name);
+	publish(name, fw_specs(name, ann, net, injail_proto6(ann)), dhcp_specs(name));
 
 	append_injail(name, render_section("lan", "eth0", proto, {
 		ipaddr: net.container,
@@ -709,8 +715,7 @@ let routed_up = function(name, ann, m) {
 let routed_down = function(name) {
 	let gw_iface = gwif(name);
 
-	fw_uci_remove(name);
-	ra_uci_remove(name);
+	withdraw(name);
 	call("network.interface." + accif(name), "remove", {});
 	call("network.interface." + gw_iface, "remove", {});
 	return 0;
