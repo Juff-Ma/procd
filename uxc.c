@@ -2388,6 +2388,34 @@ static int uvol_call_volume(const char *method, const char *vol)
 	return reply.code;
 }
 
+static bool uvol_name_valid(const char *vol)
+{
+	size_t i;
+
+	if (!vol || !*vol || strlen(vol) > 127)
+		return false;
+
+	if (!isalnum((unsigned char)vol[0]) && vol[0] != '_' && vol[0] != '.')
+		return false;
+
+	for (i = 0; vol[i]; i++)
+		if (!isalnum((unsigned char)vol[i]) && vol[i] != '.' &&
+		    vol[i] != '_' && vol[i] != '-')
+			return false;
+
+	return true;
+}
+
+static int uvol_name_check(const char *vol)
+{
+	if (uvol_name_valid(vol))
+		return 0;
+
+	fprintf(stderr, "uxc: refusing volume name '%s'\n", vol ? vol : "");
+
+	return -EINVAL;
+}
+
 static const char *uvol_volume_name(const char *path)
 {
 	const char prefix[] = "/tmp/run/uvol/";
@@ -2397,6 +2425,9 @@ static const char *uvol_volume_name(const char *path)
 		return NULL;
 
 	if (!path[plen] || strchr(path + plen, '/'))
+		return NULL;
+
+	if (!uvol_name_valid(path + plen))
 		return NULL;
 
 	return path + plen;
@@ -2427,6 +2458,9 @@ static int run_uvol(const char *action, const char *vol)
 {
 	char *argv[] = { "/usr/sbin/uvol", (char *)action, (char *)vol, NULL };
 
+	if (uvol_name_check(vol))
+		return -EINVAL;
+
 	if (uvol_ubus_available())
 		return uvol_call_volume(action, vol);
 
@@ -2440,6 +2474,9 @@ static int run_uvol_create(const char *vol, long long size, const char *mode)
 			 sizebytes, (char *)mode, NULL };
 	static struct blob_buf req;
 	struct uvol_reply reply;
+
+	if (uvol_name_check(vol))
+		return -EINVAL;
 
 	snprintf(sizebytes, sizeof(sizebytes), "%lld", size);
 
@@ -2464,6 +2501,9 @@ static int run_uvol_resize(const char *vol, long long size)
 	static struct blob_buf req;
 	struct uvol_reply reply;
 
+	if (uvol_name_check(vol))
+		return -EINVAL;
+
 	snprintf(sizebytes, sizeof(sizebytes), "%lld", size);
 
 	if (!uvol_ubus_available())
@@ -2482,6 +2522,9 @@ static int run_uvol_resize(const char *vol, long long size)
 static int uvol_status(const char *vol)
 {
 	char *argv[] = { "/usr/sbin/uvol", "status", (char *)vol, NULL };
+
+	if (uvol_name_check(vol))
+		return -EINVAL;
 
 	if (uvol_ubus_available())
 		return uvol_call_volume("status", vol);
