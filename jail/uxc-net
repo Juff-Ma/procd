@@ -2,6 +2,7 @@
 
 let fs = require("fs");
 let ubus = require("ubus");
+let uci = require("uci");
 
 let fnv1a = function(s) {
 	let h = 2166136261, i;
@@ -27,6 +28,7 @@ let contzone = function(name) { return "cz" + slug(name); };
 
 let injail_dir = "/tmp/run/uxc-net";
 let injail_path = function(name) { return injail_dir + "/" + name + ".network"; };
+let shared_lock_path = injail_dir + "/.shared.lock";
 
 let loopback_section = "config interface 'loopback'\n" +
 	"\toption device 'lo'\n" +
@@ -52,6 +54,10 @@ let quiet_call = function(object, method, data) {
 	return ubus.error() ? -1 : 0;
 };
 
+let network_reload = function() {
+	return call("network", "reload", {});
+};
+
 let autonet_service = "uxc-net";
 
 let icmpv6_types = [
@@ -61,32 +67,6 @@ let icmpv6_types = [
 	"neighbour-solicitation", "router-advertisement",
 	"neighbour-advertisement",
 ];
-
-let publish = function(name, fw, dh) {
-	let data = {};
-
-	if (length(fw))
-		data.firewall = fw;
-	if (length(dh))
-		data.dhcp = dh;
-
-	if (call("service", "set_data", { name: name, instance: name, data: data }))
-		return 1;
-
-	pkg_reload("firewall");
-	pkg_reload("dhcp");
-
-	return 0;
-};
-
-let withdraw = function(name) {
-	quiet_call("service", "set_data", { name: name, instance: name, data: {} });
-
-	pkg_reload("firewall");
-	pkg_reload("dhcp");
-
-	return 0;
-};
 
 let sidecar_path = function(name) { return "/tmp/run/uvol/.meta/uxc/" + name + ".annotations"; };
 
@@ -149,6 +129,17 @@ let with_macs = function(dev, m, hostrole, peerrole) {
 	return dev;
 };
 
+let veth_device = function(vc, m, hostrole, peerrole) {
+	return with_macs({ type: "veth", peer_name: vc }, m, hostrole, peerrole);
+};
+
+let jailed_interface = function(name, vc, jail_device, zone) {
+	let ifc = { proto: "none", device: vc, jail: name, jail_device: jail_device };
+	if (zone)
+		ifc.zone = zone;
+	return ifc;
+};
+
 let read_annotations = function(bundle, name) {
 	let ann = {}, raw, side, cfg, s, k, v;
 
@@ -194,16 +185,45 @@ let parse_backhaul = function(ann) {
 	return { id: id, address: ann["org.openwrt.network.backhaul-address"] };
 };
 
-let iface_exists = function(iface) {
-	ubus.call({ object: "network.interface." + iface, method: "status", data: {} });
-	return !ubus.error();
+let iface_status = function(iface) {
+	let r = ubus.call({ object: "network.interface." + iface, method: "status", data: {} });
+	if (ubus.error() || type(r) != "object")
+		return null;
+	return r;
 };
 
-let bridge_members = function(br) {
-	let r = ubus.call({ object: "network.device", method: "status", data: { name: br } });
-	if (ubus.error() || type(r) != "object" || type(r["bridge-members"]) != "array")
-		return -1;
-	return length(r["bridge-members"]);
+let uci_network_exists = function(net) {
+	let cursor = uci.cursor();
+
+	if (!cursor || !cursor.load("network"))
+		return false;
+	return cursor.get("network", net) != null;
+};
+
+let device_is_bridge = function(dev) {
+	let d = ubus.call({ object: "network.device", method: "status", data: { name: dev } });
+
+	if (ubus.error() || type(d) != "object")
+		return false;
+	return type(d["bridge-members"]) == "array";
+};
+
+let bridge_of = function(net, status) {
+	let dev = status.device, m;
+
+	if (type(dev) != "string") {
+		warn(sprintf("uxc-net: network '%s' has no device to attach to\n", net));
+		return null;
+	}
+	if (device_is_bridge(dev))
+		return { device: dev };
+
+	m = match(dev, /^(.+)\.([0-9]+)$/);
+	if (m && device_is_bridge(m[1]))
+		return { device: m[1], vlans: [ m[2] + ":*" ] };
+
+	warn(sprintf("uxc-net: device '%s' of network '%s' is not a bridge\n", dev, net));
+	return null;
 };
 
 
@@ -335,30 +355,45 @@ let ip2int = function(s) {
 	return (+p[0] * 16777216) + (+p[1] * 65536) + (+p[2] * 256) + (+p[3]);
 };
 
-let used_ranges = function() {
+let range_add = function(ranges, ipint, plen) {
+	let size, start;
+	plen = +plen;
+	if (ipint == null || plen < 0 || plen > 32)
+		return;
+	size = (plen == 0) ? 4294967296 : (1 << (32 - plen));
+	start = ipint - (ipint % size);
+	push(ranges, [ start, start + size - 1 ]);
+};
+
+let range_add_cidr = function(ranges, cidr) {
+	let p = split(cidr ?? "", "/");
+	range_add(ranges, ip2int(p[0]), p[1] ?? 32);
+};
+
+let published_ranges = function(ranges, shared) {
+	let ifc, a;
+	for (ifc in values(shared.interfaces))
+		for (a in ifc.ipaddr ?? [])
+			range_add_cidr(ranges, a);
+};
+
+let used_ranges = function(shared) {
 	let ranges = [];
-	let add = function(ipint, plen) {
-		plen = +plen;
-		if (ipint == null || plen < 0 || plen > 32)
-			return;
-		let size = (plen == 0) ? 4294967296 : (1 << (32 - plen));
-		let start = ipint - (ipint % size);
-		push(ranges, [ start, start + size - 1 ]);
-	};
 	let d = ubus.call({ object: "network.interface", method: "dump", data: {} });
 	let list = (type(d) == "object" && type(d.interface) == "array") ? d.interface : [];
 	for (let intf in list) {
 		for (let a in intf["ipv4-address"] ?? [])
-			add(ip2int(a.address), a.mask);
+			range_add(ranges, ip2int(a.address), a.mask);
 		for (let r in intf.route ?? [])
 			if (r.target != "0.0.0.0")
-				add(ip2int(r.target), r.mask);
+				range_add(ranges, ip2int(r.target), r.mask);
 	}
+	published_ranges(ranges, shared);
 	return ranges;
 };
 
-let pick_subnet = function() {
-	let used = used_ranges();
+let pick_subnet = function(shared) {
+	let used = used_ranges(shared);
 	let avail = function(prefix) {
 		let base = ip2int(prefix + ".0");
 		for (let r in used)
@@ -380,30 +415,129 @@ let pick_subnet = function() {
 	return null;
 };
 
-let autonet_list = function() {
-	let d = ubus.call({ object: "service", method: "get_data",
-			    data: { name: autonet_service, type: "firewall" } });
-	let nets = [], svc, k, v, sec;
 
-	if (ubus.error() || type(d) != "object")
-		return nets;
+let shared_lock = function() {
+	let f;
 
-	svc = d[autonet_service];
-	if (type(svc) != "object")
-		return nets;
-
-	for (k, v in svc) {
-		if (type(v) != "object" || type(v.firewall) != "array")
-			continue;
-		for (sec in v.firewall)
-			if (sec.type == "zone" && sec.name)
-				push(nets, sec.name);
+	fs.mkdir(injail_dir, 0755);
+	f = fs.open(shared_lock_path, "w");
+	if (!f || !f.lock("x")) {
+		warn("uxc-net: cannot lock the shared network state\n");
+		return null;
 	}
-
-	return nets;
+	return f;
 };
 
-let autonet_publish = function(nets) {
+let shared_unlock = function(f) {
+	if (!f)
+		return;
+	f.lock("u");
+	f.close();
+};
+
+let shared_read = function() {
+	let d = ubus.call({ object: "service", method: "get_data", data: { name: autonet_service } });
+	let s = {}, cur;
+
+	if (!ubus.error() && type(d) == "object")
+		cur = d[autonet_service]?.["*"];
+	if (type(cur) == "object")
+		s = cur;
+
+	return {
+		present: type(d?.[autonet_service]) == "object",
+		devices: type(s["network-device"]) == "object" ? s["network-device"] : {},
+		interfaces: type(s["network-interface"]) == "object" ? s["network-interface"] : {},
+	};
+};
+
+let shared_empty = function(shared) {
+	return !length(shared.devices) && !length(shared.interfaces);
+};
+
+let collect_devices = function(inst, names) {
+	let dev;
+
+	if (type(inst?.["network-device"]) != "object")
+		return;
+	for (dev in keys(inst["network-device"]))
+		names[dev] = true;
+};
+
+let published_devices = function() {
+	let d = ubus.call({ object: "service", method: "get_data",
+			    data: { type: "network-device" } });
+	let names = {}, svc_name, svc, inst_name, inst;
+
+	if (ubus.error() || type(d) != "object")
+		return names;
+
+	for (svc_name, svc in d) {
+		if (type(svc) != "object")
+			continue;
+		for (inst_name, inst in svc) {
+			if (svc_name == autonet_service && inst_name == "*")
+				continue;
+			collect_devices(inst, names);
+		}
+	}
+
+	return names;
+};
+
+let shared_prune = function(shared, live) {
+	let dead = [], br, dev, ifc_name, ifc;
+
+	for (br, dev in shared.devices) {
+		if (dev.type != "bridge")
+			continue;
+		dev.ports = filter(dev.ports ?? [], function(p) { return live[p] == true; });
+		if (!length(dev.ports))
+			push(dead, br);
+	}
+	for (br in dead)
+		delete shared.devices[br];
+
+	dead = [];
+	for (ifc_name, ifc in shared.interfaces)
+		if (!shared.devices[ifc.device])
+			push(dead, ifc_name);
+	for (ifc_name in dead)
+		delete shared.interfaces[ifc_name];
+};
+
+let shared_bridge_ensure = function(shared, br, ipv6) {
+	let dev = shared.devices[br];
+
+	if (dev)
+		return dev;
+	dev = { type: "bridge" };
+	if (ipv6 == false)
+		dev.ipv6 = false;
+	dev.bridge_empty = true;
+	dev.ports = [];
+	shared.devices[br] = dev;
+	return dev;
+};
+
+let shared_add_port = function(shared, br, port) {
+	let dev = shared.devices[br];
+
+	if (index(dev.ports, port) < 0)
+		push(dev.ports, port);
+	sort(dev.ports);
+};
+
+let autonet_nets = function(shared) {
+	let nets = [], n, ifc;
+
+	for (n, ifc in shared.interfaces)
+		if (ifc.zone == n)
+			push(nets, n);
+	return sort(nets);
+};
+
+let autonet_specs = function(nets) {
 	let fw = [], dh = [], net;
 
 	for (net in nets) {
@@ -425,67 +559,99 @@ let autonet_publish = function(nets) {
 		});
 	}
 
-	if (length(nets))
-		call("service", "set", { name: autonet_service,
-					 data: { firewall: fw, dhcp: dh } });
-	else
-		quiet_call("service", "delete", { name: autonet_service });
-
-	pkg_reload("firewall");
-	pkg_reload("dhcp");
+	return { firewall: fw, dhcp: dh };
 };
 
-let ensure_network = function(net) {
-	let br = "br-" + net;
-	let nets = autonet_list();
-	let subnet;
+let shared_write = function(shared, before) {
+	let specs, data;
 
-	if (iface_exists(net))
-		return (net in nets) ? 1 : 0;
-
-	subnet = pick_subnet();
-	if (!subnet)
-		return 2;
-
-	if (call("network", "create_device", { name: br, type: "bridge" }))
-		return 2;
-
-	if (call("network", "add_dynamic", {
-		name: net,
-		proto: "static",
-		device: br,
-		ipaddr: [ subnet + ".1/24" ],
-		persistent: true,
-	})) {
-		quiet_call("network", "delete_device", { name: br });
-		return 2;
+	if (shared_empty(shared)) {
+		if (!shared.present)
+			return 0;
+		quiet_call("service", "delete", { name: autonet_service });
+		return 1;
 	}
 
-	push(nets, net);
-	autonet_publish(nets);
+	if (sprintf("%J", [ shared.devices, shared.interfaces ]) == before)
+		return 0;
 
+	specs = autonet_specs(autonet_nets(shared));
+	data = {
+		"network-device": shared.devices,
+		"network-interface": shared.interfaces,
+		firewall: specs.firewall,
+		dhcp: specs.dhcp,
+	};
+	if (call("service", "set", { name: autonet_service, data: data }))
+		return -1;
 	return 1;
 };
 
-let autonet_remove = function(net) {
-	let nets = autonet_list();
-
-	if (!(net in nets))
-		return;
-	if (bridge_members("br-" + net) > 0)
-		return;
-
-	autonet_publish(filter(nets, function(n) { return n != net; }));
-
-	call("network.interface." + net, "remove", {});
-	quiet_call("network", "delete_device", { name: "br-" + net });
+let shared_snapshot = function(shared) {
+	if (shared_empty(shared))
+		return null;
+	return sprintf("%J", [ shared.devices, shared.interfaces ]);
 };
 
-let bridged_up = function(name, ann, attach, m) {
+let autonet_create = function(shared, net, vh) {
+	let br = "br-" + net;
+	let subnet = pick_subnet(shared);
+
+	if (!subnet) {
+		warn(sprintf("uxc-net: no free subnet for network '%s'\n", net));
+		return -1;
+	}
+
+	shared_bridge_ensure(shared, br, null);
+	shared_add_port(shared, br, vh);
+	shared.interfaces[net] = {
+		proto: "static",
+		device: br,
+		ipaddr: [ subnet + ".1/24" ],
+		ip6assign: 64,
+		ip6ifaceid: "::1",
+		force_link: true,
+		zone: net,
+	};
+	return 0;
+};
+
+let spec_new = function() {
+	return { devices: {}, interfaces: {}, bridge_ports: {}, firewall: [], dhcp: [] };
+};
+
+let instance_publish = function(name, spec) {
+	return call("service", "set_data", { name: name, instance: name, data: {
+		"network-device": spec.devices,
+		"network-interface": spec.interfaces,
+		"bridge-port": spec.bridge_ports,
+		firewall: spec.firewall,
+		dhcp: spec.dhcp,
+	} });
+};
+
+let instance_withdraw = function(name) {
+	return quiet_call("service", "set_data", { name: name, instance: name, data: {} });
+};
+
+let instance_published = function(name) {
+	let d = ubus.call({ object: "service", method: "get_data",
+			    data: { name: name, instance: name } });
+	let inst;
+
+	if (ubus.error() || type(d) != "object")
+		return false;
+	inst = d[name]?.[name];
+	return type(inst) == "object" && length(inst) > 0;
+};
+
+
+let bridged_up = function(name, ann, attach, m, spec, shared, owned) {
 	let net = attach.network;
 	let vh = host_veth(name), vc = cont_veth(name);
 	let proto = injail_proto(ann, "bridged"), opts = {};
 	let section6 = injail6_section(ann);
+	let status, br;
 
 	if (!proto || section6 == null)
 		return 1;
@@ -498,43 +664,30 @@ let bridged_up = function(name, ann, attach, m) {
 	if (ann["org.openwrt.network.egress"] || ann["org.openwrt.network.ingress"])
 		warn("uxc-net: bridged takes no egress/ingress (L2 inherits the joined network's zone); ignoring\n");
 
-	let created = ensure_network(net);
-	if (created == 2)
-		return 1;
+	if (shared.interfaces[net]) {
+		shared_add_port(shared, "br-" + net, vh);
+	} else if (index(owned, net) >= 0 || !uci_network_exists(net)) {
+		if (autonet_create(shared, net, vh))
+			return 1;
+	} else {
+		status = iface_status(net);
+		if (!status) {
+			warn(sprintf("uxc-net: network '%s' is not known to netifd\n", net));
+			return 1;
+		}
+		br = bridge_of(net, status);
+		if (!br)
+			return 1;
+		spec.bridge_ports[vh] = br;
+	}
 
-	if (call("network", "create_device",
-		 with_macs({ name: vh, type: "veth", peer_name: vc }, m, "h", "c")))
-		return 1;
-
-	if (call("network.interface." + net, "add_device", { name: vh, "link-ext": false }))
-		return 1;
-
-	if (call("network", "add_dynamic", {
-		name: accif(name),
-		proto: "none",
-		device: vc,
-		jail: name,
-		jail_device: "eth0",
-		zone: net,
-		persistent: true,
-	}))
-		return 1;
+	spec.devices[vh] = veth_device(vc, m, "h", "c");
+	spec.interfaces[accif(name)] = jailed_interface(name, vc, "eth0", net);
 
 	append_injail(name, render_section("lan", "eth0", proto, opts));
 	if (section6 != "")
 		append_injail(name, section6);
 
-	return 0;
-};
-
-let bridged_down = function(name, attach) {
-	let vh = host_veth(name);
-
-	call("network.interface." + accif(name), "remove", {});
-	if (attach.network) {
-		call("network.interface." + attach.network, "remove_device", { name: vh, "link-ext": false });
-		autonet_remove(attach.network);
-	}
 	return 0;
 };
 
@@ -658,11 +811,10 @@ let dhcp_specs = function(name) {
 	} ];
 };
 
-let routed_up = function(name, ann, m) {
+let routed_up = function(name, ann, m, spec) {
 	let czone = contzone(name);
 	let net = routed_subnet(name, ann);
 	let vh = host_veth(name), vc = cont_veth(name);
-	let gw_iface = gwif(name);
 	let gw_ip = split(net.gw_cidr, "/")[0];
 	let proto = injail_proto(ann, "routed");
 	let section6 = injail6_section(ann);
@@ -670,35 +822,19 @@ let routed_up = function(name, ann, m) {
 	if (!proto || section6 == null)
 		return 1;
 
-	if (call("network", "create_device",
-		 with_macs({ name: vh, type: "veth", peer_name: vc }, m, "h", "c")))
-		return 1;
-
-	if (call("network", "add_dynamic", {
-		name: gw_iface,
+	spec.devices[vh] = veth_device(vc, m, "h", "c");
+	spec.interfaces[gwif(name)] = {
 		proto: "static",
 		device: vh,
 		ipaddr: [ net.gw_cidr ],
 		ip6assign: 64,
 		ip6ifaceid: "::1",
 		force_link: true,
-		persistent: true,
 		zone: czone,
-	}))
-		return 1;
-
-	if (call("network", "add_dynamic", {
-		name: accif(name),
-		proto: "none",
-		device: vc,
-		jail: name,
-		jail_device: "eth0",
-		zone: czone,
-		persistent: true,
-	}))
-		return 1;
-
-	publish(name, fw_specs(name, ann, net, injail_proto6(ann)), dhcp_specs(name));
+	};
+	spec.interfaces[accif(name)] = jailed_interface(name, vc, "eth0", czone);
+	spec.firewall = fw_specs(name, ann, net, injail_proto6(ann));
+	spec.dhcp = dhcp_specs(name);
 
 	append_injail(name, render_section("lan", "eth0", proto, {
 		ipaddr: net.container,
@@ -712,44 +848,18 @@ let routed_up = function(name, ann, m) {
 	return 0;
 };
 
-let routed_down = function(name) {
-	let gw_iface = gwif(name);
-
-	withdraw(name);
-	call("network.interface." + accif(name), "remove", {});
-	call("network.interface." + gw_iface, "remove", {});
-	return 0;
-};
-
-let backhaul_up = function(name, bh, m) {
+let backhaul_up = function(name, bh, m, spec, shared) {
 	let br = bh_bridge(bh.id);
 	let iface = bhseg(bh.id);
 	let vh = bh_host_veth(name), vc = bh_cont_veth(name);
 
-	if (!iface_exists(iface)) {
-		if (call("network", "create_device", { name: br, type: "bridge", ipv6: false }))
-			return 1;
-		if (call("network", "add_dynamic", {
-			name: iface, proto: "none", device: br, persistent: true,
-		}))
-			return 1;
-	}
+	shared_bridge_ensure(shared, br, false);
+	shared_add_port(shared, br, vh);
+	if (!shared.interfaces[iface])
+		shared.interfaces[iface] = { proto: "none", device: br };
 
-	if (call("network", "create_device",
-		 with_macs({ name: vh, type: "veth", peer_name: vc }, m, "bh", "bc")))
-		return 1;
-	if (call("network.interface." + iface, "add_device", { name: vh, "link-ext": false }))
-		return 1;
-
-	if (call("network", "add_dynamic", {
-		name: bhif(name),
-		proto: "none",
-		device: vc,
-		jail: name,
-		jail_device: "bh0",
-		persistent: true,
-	}))
-		return 1;
+	spec.devices[vh] = veth_device(vc, m, "bh", "bc");
+	spec.interfaces[bhif(name)] = jailed_interface(name, vc, "bh0", null);
 
 	if (bh.address)
 		append_injail(name, render_section("backhaul", "bh0", "static", {
@@ -760,32 +870,34 @@ let backhaul_up = function(name, bh, m) {
 	return 0;
 };
 
-let backhaul_down = function(name, bh) {
-	let br = bh_bridge(bh.id);
-	let iface = bhseg(bh.id);
-	let vh = bh_host_veth(name);
 
-	call("network.interface." + iface, "remove_device", { name: vh, "link-ext": false });
-	call("network.interface." + bhif(name), "remove", {});
+let shared_reconcile = function() {
+	let lock = shared_lock(), shared, before, changed;
 
-	if (bridge_members(br) == 0) {
-		call("network.interface." + iface, "remove", {});
-		call("network", "delete_device", { name: br });
-	}
-
-	return 0;
+	if (!lock)
+		return 0;
+	shared = shared_read();
+	before = shared_snapshot(shared);
+	shared_prune(shared, published_devices());
+	changed = shared_write(shared, before);
+	shared_unlock(lock);
+	return changed;
 };
 
+let instance_rollback = function(name) {
+	instance_withdraw(name);
+	shared_reconcile();
+};
 
 let do_up = function(name, bundle) {
-	let attach, bh;
+	let attach, bh, ann, roles, m, spec, shared, owned, before, lock, rc, written;
 
 	if (!bundle) {
 		warn("uxc-net: 'up' needs a bundle path\n");
 		return 1;
 	}
 
-	let ann = read_annotations(bundle, name);
+	ann = read_annotations(bundle, name);
 	if (ann == null) {
 		warn("uxc-net: cannot read annotations from " + bundle + "/config.json\n");
 		return 1;
@@ -796,7 +908,14 @@ let do_up = function(name, bundle) {
 
 	fs.unlink(injail_path(name));
 
-	let roles = [];
+	if (attach.kind == "unknown") {
+		warn(sprintf("uxc-net: attach '%s' not implemented\n", attach.raw ?? attach.kind));
+		return 1;
+	}
+	if (attach.kind != "bridged" && attach.kind != "routed" && !bh)
+		return 0;
+
+	roles = [];
 	if (attach.kind == "bridged" || attach.kind == "routed") {
 		push(roles, "h");
 		push(roles, "c");
@@ -805,50 +924,63 @@ let do_up = function(name, bundle) {
 		push(roles, "bh");
 		push(roles, "bc");
 	}
-	let m = ensure_macs(name, roles);
+	m = ensure_macs(name, roles);
+	spec = spec_new();
 
-	if (attach.kind == "bridged") {
-		if (bridged_up(name, ann, attach, m))
-			return 1;
-	} else if (attach.kind == "routed") {
-		if (routed_up(name, ann, m))
-			return 1;
-	} else if (attach.kind == "unknown") {
-		warn(sprintf("uxc-net: attach '%s' not implemented\n", attach.raw ?? attach.kind));
+	lock = shared_lock();
+	if (!lock)
+		return 1;
+	shared = shared_read();
+	owned = autonet_nets(shared);
+	before = shared_snapshot(shared);
+	shared_prune(shared, published_devices());
+
+	rc = 0;
+	if (attach.kind == "bridged")
+		rc = bridged_up(name, ann, attach, m, spec, shared, owned);
+	else if (attach.kind == "routed")
+		rc = routed_up(name, ann, m, spec);
+	if (!rc && bh)
+		rc = backhaul_up(name, bh, m, spec, shared);
+	if (!rc && shared_write(shared, before) < 0)
+		rc = 1;
+	written = !rc;
+	if (!rc && instance_publish(name, spec))
+		rc = 1;
+	shared_unlock(lock);
+	if (!rc && network_reload())
+		rc = 1;
+	if (rc) {
+		if (written)
+			instance_rollback(name);
 		return 1;
 	}
 
-	if (bh)
-		if (backhaul_up(name, bh, m))
-			return 1;
+	pkg_reload("firewall");
+	pkg_reload("dhcp");
 
 	return 0;
 };
 
-let do_down = function(name, bundle) {
-	let ann = read_annotations(bundle, name);
-	if (ann == null)
-		ann = {};
+let do_down = function(name) {
+	let had, changed;
 
-	let configured = !!fs.stat(injail_path(name));
 	fs.unlink(injail_path(name));
 
-	let attach = parse_attach(ann);
-	let bh = parse_backhaul(ann);
+	had = instance_published(name);
+	if (had)
+		instance_withdraw(name);
 
-	if (bh)
-		backhaul_down(name, bh);
+	changed = shared_reconcile();
 
-	if (attach.kind == "none" || attach.kind == "host")
+	if (!had && changed <= 0)
 		return 0;
-	if (attach.kind == "routed")
-		return routed_down(name);
-	if (attach.kind == "bridged")
-		return bridged_down(name, attach);
 
-	if (!configured)
-		return 0;
-	return routed_down(name);
+	network_reload();
+	pkg_reload("firewall");
+	pkg_reload("dhcp");
+
+	return 0;
 };
 
 let name = ARGV[0];
@@ -863,7 +995,7 @@ if (!name || !action) {
 if (action == "up")
 	exit(do_up(name, bundle));
 else if (action == "down")
-	exit(do_down(name, bundle));
+	exit(do_down(name));
 
 warn(sprintf("uxc-net: unknown action '%s'\n", action));
 exit(22);
