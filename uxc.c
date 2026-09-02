@@ -1875,10 +1875,11 @@ static int uxc_kill(char *name, int signal, bool all)
 			fprintf(stderr, "uxc: warning: cannot arm instance.* watcher\n");
 	}
 
-	if (ubus_invoke(ctx, id, "kill", req.head, NULL, NULL, 3000)) {
+	ret = ubus_invoke(ctx, id, "kill", req.head, NULL, NULL, 3000);
+	if (ret) {
 		if (wait_stop)
 			uxc_wait_disarm();
-		return -EIO;
+		return (ret == UBUS_STATUS_NOT_FOUND) ? -ENOENT : -EIO;
 	}
 
 	if (wait_stop) {
@@ -2786,16 +2787,16 @@ static int uxc_delete(char *name, bool force, bool volumes)
 
 	rsstate = avl_find_element(&runtime, name, rsstate, avl);
 
-	if (rsstate && rsstate->running) {
-		if (force) {
-			ret = uxc_kill(name, SIGKILL, true);
-			if (ret)
-				goto errout;
+	if (rsstate && rsstate->running && !force) {
+		ret = -EWOULDBLOCK;
+		goto errout;
+	}
 
-		} else {
-			ret = -EWOULDBLOCK;
+	if (rsstate && rsstate->running) {
+		ret = uxc_kill(name, SIGKILL, true);
+		if (ret && ret != -ENOENT)
 			goto errout;
-		}
+		ret = 0;
 	}
 
 	if (rsstate) {
@@ -2828,7 +2829,8 @@ static int uxc_delete(char *name, bool force, bool volumes)
 				fprintf(stderr, "uxc: warning: cannot arm instance.* watcher\n");
 		}
 
-		if (ubus_invoke(ctx, id, "delete", req.head, NULL, NULL, 3000)) {
+		ret = ubus_invoke(ctx, id, "delete", req.head, NULL, NULL, 3000);
+		if (ret && ret != UBUS_STATUS_NOT_FOUND) {
 			blob_buf_free(&req);
 			if (have_cont_obj)
 				uxc_wait_disarm();
@@ -2836,12 +2838,13 @@ static int uxc_delete(char *name, bool force, bool volumes)
 			goto errout;
 		}
 
-		if (have_cont_obj) {
-			if (uxc_wait_run(&wait_state, 30000) == -ETIMEDOUT)
-				fprintf(stderr, "uxc: warning: timed out waiting for container.%s removal\n",
-					rsstate->container_name);
+		if (have_cont_obj && !ret &&
+		    uxc_wait_run(&wait_state, 30000) == -ETIMEDOUT)
+			fprintf(stderr, "uxc: warning: timed out waiting for container.%s removal\n",
+				rsstate->container_name);
+		if (have_cont_obj)
 			uxc_wait_disarm();
-		}
+		ret = 0;
 	}
 
 	usettings = avl_find_element(&settings, name, usettings, avl);
