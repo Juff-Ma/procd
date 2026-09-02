@@ -223,6 +223,7 @@ static struct {
 		int priority;
 	} ioprio;
 	unsigned long mdwe_flags;
+	unsigned long rootfs_propagation;
 	struct landlock_config landlock;
 	bool private_ubus;
 	bool private_netifd;
@@ -2920,6 +2921,12 @@ static void post_jail_fs(void)
 	char buf[1];
 	ssize_t n;
 
+	if (opts.rootfs_propagation && (opts.namespace & CLONE_NEWNS) &&
+	    mount(NULL, "/", NULL, opts.rootfs_propagation, NULL)) {
+		ERROR("rootfsPropagation: %m\n");
+		free_and_exit(EXIT_FAILURE);
+	}
+
 	do {
 		n = read(pipes[2], buf, 1);
 	} while (n < 0 && errno == EINTR);
@@ -4233,6 +4240,27 @@ static int parseOCIlinuxpersonality(struct blob_attr *msg)
 	return 0;
 }
 
+static int parseOCIrootfspropagation(const char *mode)
+{
+	if (!*mode)
+		return 0;
+
+	if (!strcmp(mode, "shared"))
+		opts.rootfs_propagation = MS_REC | MS_SHARED;
+	else if (!strcmp(mode, "slave"))
+		opts.rootfs_propagation = MS_REC | MS_SLAVE;
+	else if (!strcmp(mode, "private"))
+		opts.rootfs_propagation = MS_REC | MS_PRIVATE;
+	else if (!strcmp(mode, "unbindable"))
+		opts.rootfs_propagation = MS_REC | MS_UNBINDABLE;
+	else {
+		ERROR("unknown linux.rootfsPropagation %s\n", mode);
+		return EINVAL;
+	}
+
+	return 0;
+}
+
 static int parseOCIlinux(struct blob_attr *msg)
 {
 	struct blob_attr *tb[__OCI_LINUX_MAX];
@@ -4245,6 +4273,12 @@ static int parseOCIlinux(struct blob_attr *msg)
 	char *cgsep;
 
 	blobmsg_parse(oci_linux_policy, __OCI_LINUX_MAX, tb, blobmsg_data(msg), blobmsg_len(msg));
+
+	if (tb[OCI_LINUX_ROOTFSPROPAGATION]) {
+		res = parseOCIrootfspropagation(blobmsg_get_string(tb[OCI_LINUX_ROOTFSPROPAGATION]));
+		if (res)
+			return res;
+	}
 
 	if (tb[OCI_LINUX_PERSONALITY]) {
 		res = parseOCIlinuxpersonality(tb[OCI_LINUX_PERSONALITY]);
