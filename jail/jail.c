@@ -935,8 +935,8 @@ static int prepare_jail_dev(void)
 
 	/* Dev symbolic links as defined in OCI spec */
 	snprintf(path, sizeof(path), "%s/ptmx", jail_dev);
-	if (symlink("/dev/pts/ptmx", path))
-		WARNING("symlink() failed to create link to /dev/pts/ptmx");
+	if (symlink("pts/ptmx", path))
+		WARNING("symlink() failed to create link to pts/ptmx");
 
 	snprintf(path, sizeof(path), "%s/fd", jail_dev);
 	if (symlink("/proc/self/fd", path))
