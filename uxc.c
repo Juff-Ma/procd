@@ -1676,6 +1676,7 @@ static int uxc_start(const char *name, bool console)
 
 	ret = ubus_invoke(ctx, id, "start", NULL, NULL, NULL, 3000);
 	if (ret) {
+		fprintf(stderr, "uxc: start %s: %s\n", name, ubus_strerror(ret));
 		uxc_wait_disarm();
 		return ret;
 	}

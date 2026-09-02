@@ -4540,12 +4540,12 @@ static int parseOCI(const char *jsonfile)
 	if (tb[OCI_DOMAINNAME])
 		opts.domainname = strdup(blobmsg_get_string(tb[OCI_DOMAINNAME]));
 
-	if (!tb[OCI_PROCESS]) {
+	if (!tb[OCI_PROCESS] && opts.immediately) {
 		res=ENODATA;
 		goto errout;
 	}
 
-	if ((res = parseOCIprocess(tb[OCI_PROCESS])))
+	if (tb[OCI_PROCESS] && (res = parseOCIprocess(tb[OCI_PROCESS])))
 		goto errout;
 
 	if (!tb[OCI_ROOT]) {
@@ -4707,6 +4707,11 @@ static int handle_start(struct ubus_context *ctx, struct ubus_object *obj,
 {
 	if (jail_oci_state != OCI_STATE_CREATED)
 		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	if (!opts.jail_argv) {
+		ERROR("start refused: the bundle defines no process\n");
+		return UBUS_STATUS_INVALID_ARGUMENT;
+	}
 
 	uloop_timeout_add(&start_container_timeout);
 
