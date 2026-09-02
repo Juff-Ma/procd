@@ -200,15 +200,46 @@ let uci_network_exists = function(net) {
 	return cursor.get("network", net) != null;
 };
 
-let device_is_bridge = function(dev) {
+let device_status = function(dev) {
 	let d = ubus.call({ object: "network.device", method: "status", data: { name: dev } });
 
 	if (ubus.error() || type(d) != "object")
-		return false;
-	return type(d["bridge-members"]) == "array";
+		return null;
+	return d;
 };
 
-let bridge_of = function(net, status) {
+let device_is_bridge = function(dev) {
+	return type(device_status(dev)?.["bridge-members"]) == "array";
+};
+
+let bridge_vlan_ids = function(br) {
+	return map(device_status(br)?.["bridge-vlans"] ?? [], function(v) { return v.id; });
+};
+
+let bridge_port = function(br, pvid, vlans) {
+	let port = { device: br }, flags = [], have, v;
+
+	if (pvid != null)
+		push(flags, pvid + ":*");
+	if (length(vlans))
+		have = bridge_vlan_ids(br);
+	for (v in vlans) {
+		if (v.vid == pvid) {
+			warn(sprintf("uxc-net: VLAN %d on '%s' is already the network's own VLAN\n", v.vid, br));
+			return null;
+		}
+		if (index(have, v.vid) < 0) {
+			warn(sprintf("uxc-net: bridge '%s' has no VLAN %d\n", br, v.vid));
+			return null;
+		}
+		push(flags, v.vid + (v.tagged ? ":t" : ""));
+	}
+	if (length(flags))
+		port.vlans = flags;
+	return port;
+};
+
+let bridge_of = function(net, status, vlans) {
 	let dev = status.device, m;
 
 	if (type(dev) != "string") {
@@ -216,11 +247,11 @@ let bridge_of = function(net, status) {
 		return null;
 	}
 	if (device_is_bridge(dev))
-		return { device: dev };
+		return bridge_port(dev, null, vlans);
 
 	m = match(dev, /^(.+)\.([0-9]+)$/);
 	if (m && device_is_bridge(m[1]))
-		return { device: m[1], vlans: [ m[2] + ":*" ] };
+		return bridge_port(m[1], +m[2], vlans);
 
 	warn(sprintf("uxc-net: device '%s' of network '%s' is not a bridge\n", dev, net));
 	return null;
@@ -329,6 +360,44 @@ let injail6_section = function(ann) {
 	return render_section("lan6", "eth0", "dhcpv6", opts);
 };
 
+let render_vlan_device = function(parent, vid) {
+	return "config device\n" +
+		"\toption type '8021q'\n" +
+		"\toption name '" + parent + "." + vid + "'\n" +
+		"\toption ifname '" + parent + "'\n" +
+		"\toption vid '" + vid + "'\n";
+};
+
+let injail_vlan_section = function(ann, vid) {
+	let addr = ann["org.openwrt.network.vlan." + vid + ".address"];
+	let proto = "none", opts = {};
+
+	if (addr != null && addr != "") {
+		if (index(addr, "/") < 0) {
+			warn(sprintf("uxc-net: org.openwrt.network.vlan.%d.address must be address/prefix\n", vid));
+			return null;
+		}
+		proto = "static";
+		opts.ipaddr = addr;
+	}
+	return render_vlan_device("eth0", vid) +
+	       render_section("vlan" + vid, "eth0." + vid, proto, opts);
+};
+
+let injail_vlan_sections = function(ann, vlans) {
+	let out = "", s, v;
+
+	for (v in vlans) {
+		if (!v.tagged)
+			continue;
+		s = injail_vlan_section(ann, v.vid);
+		if (s == null)
+			return null;
+		out += s;
+	}
+	return out;
+};
+
 let csv = function(val) {
 	let list = [], i, parts;
 	if (type(val) != "string")
@@ -337,6 +406,30 @@ let csv = function(val) {
 	for (i = 0; i < length(parts); i++)
 		if (parts[i] != "")
 			push(list, parts[i]);
+	return list;
+};
+
+let parse_vlans = function(ann) {
+	let list = [], vids = [], tok, m, vid, tagged, i;
+
+	for (tok in csv(ann["org.openwrt.network.vlans"])) {
+		m = match(tok, /^([0-9]+)(:t)?$/);
+		vid = m ? +m[1] : 0;
+		if (vid < 1 || vid > 4094) {
+			warn(sprintf("uxc-net: bad org.openwrt.network.vlans entry '%s'\n", tok));
+			return null;
+		}
+		tagged = m[2] != null;
+		i = index(vids, vid);
+		if (i >= 0 && list[i].tagged == tagged)
+			continue;
+		if (i >= 0) {
+			warn(sprintf("uxc-net: VLAN %d is listed both tagged and untagged in org.openwrt.network.vlans\n", vid));
+			return null;
+		}
+		push(vids, vid);
+		push(list, { vid: vid, tagged: tagged });
+	}
 	return list;
 };
 
@@ -651,9 +744,13 @@ let bridged_up = function(name, ann, attach, m, spec, shared, owned) {
 	let vh = host_veth(name), vc = cont_veth(name);
 	let proto = injail_proto(ann, "bridged"), opts = {};
 	let section6 = injail6_section(ann);
-	let status, br;
+	let vlans = parse_vlans(ann);
+	let vlan_sections, on_demand, status, br;
 
-	if (!proto || section6 == null)
+	if (!proto || section6 == null || vlans == null)
+		return 1;
+	vlan_sections = injail_vlan_sections(ann, vlans);
+	if (vlan_sections == null)
 		return 1;
 	if (proto == "static") {
 		opts = bridged_static_opts(ann);
@@ -664,9 +761,15 @@ let bridged_up = function(name, ann, attach, m, spec, shared, owned) {
 	if (ann["org.openwrt.network.egress"] || ann["org.openwrt.network.ingress"])
 		warn("uxc-net: bridged takes no egress/ingress (L2 inherits the joined network's zone); ignoring\n");
 
+	on_demand = shared.interfaces[net] != null || index(owned, net) >= 0 || !uci_network_exists(net);
+	if (on_demand && length(vlans)) {
+		warn(sprintf("uxc-net: network '%s' is created on demand and has no VLANs to attach to\n", net));
+		return 1;
+	}
+
 	if (shared.interfaces[net]) {
 		shared_add_port(shared, "br-" + net, vh);
-	} else if (index(owned, net) >= 0 || !uci_network_exists(net)) {
+	} else if (on_demand) {
 		if (autonet_create(shared, net, vh))
 			return 1;
 	} else {
@@ -675,7 +778,7 @@ let bridged_up = function(name, ann, attach, m, spec, shared, owned) {
 			warn(sprintf("uxc-net: network '%s' is not known to netifd\n", net));
 			return 1;
 		}
-		br = bridge_of(net, status);
+		br = bridge_of(net, status, vlans);
 		if (!br)
 			return 1;
 		spec.bridge_ports[vh] = br;
@@ -687,6 +790,8 @@ let bridged_up = function(name, ann, attach, m, spec, shared, owned) {
 	append_injail(name, render_section("lan", "eth0", proto, opts));
 	if (section6 != "")
 		append_injail(name, section6);
+	if (vlan_sections != "")
+		append_injail(name, vlan_sections);
 
 	return 0;
 };
