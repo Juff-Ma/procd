@@ -253,6 +253,9 @@ static long jail_clone3(struct clone_args *args)
 static int jail_process_pidfd = -1;
 
 static struct ubus_context *parent_ctx;
+static bool jail_stop_requested;
+static bool netifd_restart_pending;
+static char **restart_argv;
 
 int console_fd;
 static int console_slave_fd = -1;
@@ -1449,9 +1452,60 @@ static void notify_signal(int fd)
 static bool jail_ptrace_seccomp(void);
 static bool jail_inproc_seccomp(void);
 
+static int restart_argv_save(int argc, char **argv)
+{
+	int i;
+
+	restart_argv = calloc(argc + 1, sizeof(*restart_argv));
+	if (!restart_argv)
+		return ENOMEM;
+
+	for (i = 0; i < argc; i++) {
+		restart_argv[i] = strdup(argv[i]);
+		if (!restart_argv[i])
+			return ENOMEM;
+	}
+
+	return 0;
+}
+
+static bool jail_restarting(void)
+{
+	return !exit_from_child && netifd_restart_pending && !jail_stop_requested;
+}
+
+static void jail_restart_exec(void)
+{
+	char **argv;
+	int argc, n, i;
+
+	for (argc = 0; restart_argv[argc]; argc++);
+
+	argv = calloc(argc + 2, sizeof(*argv));
+	if (!argv)
+		return;
+
+	n = 0;
+	argv[n++] = restart_argv[0];
+	argv[n++] = "-i";
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(restart_argv[i], "-a") && i + 1 < argc) {
+			i++;
+			continue;
+		}
+		argv[n++] = restart_argv[i];
+	}
+
+	INFO("restarting the container\n");
+	syscall(SYS_close_range, 3, ~0U, CLOSE_RANGE_CLOEXEC);
+	execv("/proc/self/exe", argv);
+	ERROR("failed to re-execute for the restart: %m\n");
+	free(argv);
+}
+
 static void free_and_exit(int ret)
 {
-	if (!exit_from_child)
+	if (!exit_from_child && !jail_restarting())
 		notify_signal(opts.notify_fd);
 
 	if (!exit_from_child && opts.jail_network_started) {
@@ -1477,6 +1531,9 @@ static void free_and_exit(int ret)
 		ubus_free(parent_ctx);
 
 	free_opts(!exit_from_child);
+
+	if (jail_restarting())
+		jail_restart_exec();
 
 	exit(ret);
 }
@@ -2200,6 +2257,9 @@ static void jail_process_timeout_cb(struct uloop_timeout *t)
 
 static void jail_handle_signal(int signo)
 {
+	if (signo == SIGTERM)
+		jail_stop_requested = true;
+
 	if (hook_running) {
 		DEBUG("forwarding signal %d to the hook process\n", signo);
 		kill(hook_process.pid, signo);
@@ -5137,6 +5197,9 @@ container_handle_kill(struct ubus_context *ctx, struct ubus_object *obj,
 	if (cur)
 		all = blobmsg_get_bool(cur);
 
+	if (sig == SIGTERM || sig == SIGKILL)
+		jail_stop_requested = true;
+
 	if (jail_oci_state == OCI_STATE_CREATING)
 		return UBUS_STATUS_NOT_FOUND;
 	if (jail_oci_state == OCI_STATE_PAUSED && sig != SIGKILL && sig != 0)
@@ -6068,6 +6131,13 @@ static struct ubus_object container_object = {
 	.n_methods = ARRAY_SIZE(container_methods),
 };
 
+static void netifd_restart_cb(struct ubus_context *ctx, struct ubus_event_handler *ev,
+			      const char *type, struct blob_attr *msg);
+
+static struct ubus_event_handler netifd_restart_handler = {
+	.cb = netifd_restart_cb,
+};
+
 static void post_main(struct uloop_timeout *t);
 static struct uloop_timeout post_main_timeout = {
 	.cb = post_main,
@@ -6096,6 +6166,11 @@ int main(int argc, char **argv)
 
 	if (uid) {
 		ERROR("not root, aborting: %m\n");
+		return EXIT_FAILURE;
+	}
+
+	if (restart_argv_save(argc, argv)) {
+		ERROR("out of memory\n");
 		return EXIT_FAILURE;
 	}
 
@@ -6574,6 +6649,43 @@ static int run_uxc_net(const char *action)
 	while (waitpid(pid, &status, 0) < 0 && errno == EINTR);
 
 	return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+static void netifd_restart_cb(struct ubus_context *ctx, struct ubus_event_handler *ev,
+			      const char *type, struct blob_attr *msg)
+{
+	static const struct blobmsg_policy pol = {
+		.name = "path", .type = BLOBMSG_TYPE_STRING
+	};
+	struct blob_attr *tb;
+
+	if (!msg)
+		return;
+
+	blobmsg_parse(&pol, 1, &tb, blob_data(msg), blob_len(msg));
+	if (!tb || strcmp(blobmsg_get_string(tb), "network.interface"))
+		return;
+
+	if (!jail_running || jail_stop_requested || netifd_restart_pending)
+		return;
+
+	INFO("netifd restarted, restarting the container\n");
+	netifd_restart_pending = true;
+	if (jail_pidfd_send_signal(SIGTERM)) {
+		ERROR("cannot stop the container for the restart: %m\n");
+		netifd_restart_pending = false;
+		return;
+	}
+	uloop_timeout_set(&jail_process_timeout, UXC_STOP_TIMEOUT * 1000);
+}
+
+static void netifd_restart_watch(void)
+{
+	if (!(opts.namespace & CLONE_NEWNET) || !opts.ocibundle || !opts.name)
+		return;
+
+	if (ubus_register_event_handler(parent_ctx, &netifd_restart_handler, "ubus.object.add"))
+		WARNING("cannot watch for netifd restarts\n");
 }
 
 static void post_main(struct uloop_timeout *t)
@@ -7321,10 +7433,12 @@ static void pipe_send_start_container(struct uloop_timeout *t)
 
 static void post_poststart(void)
 {
-	if (hook_chain_failed)
+	if (hook_chain_failed) {
 		ERROR("poststart hook failed; stopping container\n");
-	else
+	} else {
+		netifd_restart_watch();
 		uloop_run(); /* idle here while jail is running */
+	}
 
 	if (jail_running) {
 		DEBUG("killing jail process\n");
