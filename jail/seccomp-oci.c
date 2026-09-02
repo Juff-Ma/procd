@@ -935,11 +935,6 @@ int applyOCIlinuxseccomp(struct sock_fprog *prog, const char *container_id,
 {
 	int listener_fd = -1;
 
-	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) {
-		ERROR("prctl(PR_SET_NO_NEW_PRIVS) failed: %m\n");
-		goto errout;
-	}
-
 	if (seccomp_uses_notify) {
 		if (!seccomp_listener_path) {
 			ERROR("seccomp: SCMP_ACT_NOTIFY used without listenerPath\n");

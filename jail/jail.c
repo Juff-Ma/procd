@@ -1446,6 +1446,7 @@ static void notify_signal(int fd)
 }
 
 static bool jail_ptrace_seccomp(void);
+static bool jail_inproc_seccomp(void);
 
 static void free_and_exit(int ret)
 {
@@ -2938,11 +2939,18 @@ static void post_jail_fs(void)
 static void post_start_hook(void)
 {
 	int pw_uid, pw_gid, gr_gid;
+	struct sock_fprog *seccomp_prog = opts.ociseccomp_linker ?: opts.ociseccomp;
 
 	if (opts.scheduler.set && applyOCIprocessscheduler())
 		free_and_exit(EXIT_FAILURE);
 
 	if (opts.ioprio.set && applyOCIprocessiopriority())
+		free_and_exit(EXIT_FAILURE);
+
+	syscall(SYS_close_range, 3, ~0U, CLOSE_RANGE_CLOEXEC);
+
+	if (seccomp_prog && jail_inproc_seccomp() && !opts.no_new_privs &&
+	    applyOCIlinuxseccomp(seccomp_prog, opts.name, opts.ocibundle))
 		free_and_exit(EXIT_FAILURE);
 
 	/*
@@ -3076,13 +3084,12 @@ static void post_start_hook(void)
 		free_and_exit(EXIT_FAILURE);
 	}
 
-	if (opts.ociseccomp && seccomp_oci_needs_inproc() &&
-	    applyOCIlinuxseccomp(opts.ociseccomp_linker ?: opts.ociseccomp, opts.name, opts.ocibundle))
+	if (seccomp_prog && jail_inproc_seccomp() && opts.no_new_privs &&
+	    applyOCIlinuxseccomp(seccomp_prog, opts.name, opts.ocibundle))
 		free_and_exit(EXIT_FAILURE);
 
 	uloop_end();
 	free_opts(false);
-	syscall(SYS_close_range, 3, ~0U, CLOSE_RANGE_CLOEXEC);
 	if (jail_ptrace_seccomp() && ptrace(PTRACE_TRACEME, 0, 0, 0)) {
 		ERROR("PTRACE_TRACEME failed: %m\n");
 		exit(EXIT_FAILURE);
@@ -7031,12 +7038,20 @@ static void post_create_runtime(void)
 		pipe_send_start_container(NULL);
 }
 
+static bool jail_inproc_seccomp(void)
+{
+	if (seccomp_oci_needs_inproc())
+		return true;
+
+	return opts.ocibundle && !opts.no_new_privs && opts.seccomp_mode == SECCOMP_MODE_ENFORCE;
+}
+
 static bool jail_ptrace_seccomp(void)
 {
 	if (opts.seccomp_mode == SECCOMP_MODE_TRACE)
 		return true;
 
-	return opts.ociseccomp && !seccomp_oci_needs_inproc();
+	return opts.ociseccomp && !jail_inproc_seccomp();
 }
 
 static void jail_seccomp_run(void)
